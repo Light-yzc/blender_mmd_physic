@@ -1,7 +1,7 @@
 bl_info = {
     "name": "骨骼链阻尼追踪",
     "author": "WANG",
-    "version": (5, 30),
+    "version": (5, 31),
     "blender": (3, 0, 0),
     "location": "View3D > 侧边栏(N) > 骨骼链",
     "description": "骨骼链物理、碰撞与细分，支持 Wiggle/Ruri 区间烘焙和恢复原动作",
@@ -463,6 +463,9 @@ class ChainGroup(PropertyGroup):
 class BoneChainProps(PropertyGroup):
     groups: CollectionProperty(type=ChainGroup)
     group_index: IntProperty(default=0)
+    native_cloth_open: BoolProperty(
+        name='场景原生布料烘焙', default=False, options={'SKIP_SAVE'},
+        description='展开或折叠场景原生布料烘焙设置')
     native_cloth_start: IntProperty(
         name='起始帧', min=-1048574, max=1048574,
         get=lambda self: self.get('native_cloth_start', self.id_data.frame_start),
@@ -3503,20 +3506,22 @@ class BONECHAIN_PT_panel(Panel):
         obj = context.active_object
         props = context.scene.bonechain_props
         native = layout.box()
-        native.label(text='场景原生布料烘焙', icon='PHYSICS')
-        cloth_objects = [o for o in context.scene.objects if _native_cloth_modifiers(o)]
-        native.label(text=f'自动识别 {len(cloth_objects)} 个启用的布料对象（含代理）')
-        row = native.row(align=True)
-        row.prop(props, 'native_cloth_start')
-        row.prop(props, 'native_cloth_end')
-        native.prop(props, 'native_cloth_preroll')
-        native.prop(props, 'native_cloth_bake_bones')
-        if props.native_cloth_bake_bones:
-            native.label(text='上游骨架中的启用组会一起烘焙', icon='INFO')
-        native.operator('bonechain.native_cloth_range', icon='TIME')
-        native.label(text='骨骼物理 → 上游布料 → 下游布料', icon='SORTTIME')
-        native.operator('bonechain.native_cloth_bake', icon='RENDER_ANIMATION')
-        native.operator('bonechain.native_cloth_delete', icon='TRASH')
+        native.prop(props, 'native_cloth_open', emboss=False,
+                    icon='TRIA_DOWN' if props.native_cloth_open else 'TRIA_RIGHT')
+        if props.native_cloth_open:
+            cloth_objects = [o for o in context.scene.objects if _native_cloth_modifiers(o)]
+            native.label(text=f'自动识别 {len(cloth_objects)} 个启用的布料对象（含代理）')
+            row = native.row(align=True)
+            row.prop(props, 'native_cloth_start')
+            row.prop(props, 'native_cloth_end')
+            native.prop(props, 'native_cloth_preroll')
+            native.prop(props, 'native_cloth_bake_bones')
+            if props.native_cloth_bake_bones:
+                native.label(text='上游骨架中的启用组会一起烘焙', icon='INFO')
+            native.operator('bonechain.native_cloth_range', icon='TIME')
+            native.label(text='骨骼物理 → 上游布料 → 下游布料', icon='SORTTIME')
+            native.operator('bonechain.native_cloth_bake', icon='RENDER_ANIMATION')
+            native.operator('bonechain.native_cloth_delete', icon='TRASH')
         if not (obj and obj.type == 'ARMATURE' and context.mode == 'POSE'):
             layout.label(text="请在姿态模式下操作", icon='INFO')
             return
