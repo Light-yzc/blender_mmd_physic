@@ -1,0 +1,90 @@
+--- a/wiggle_2.py
++++ b/wiggle_2.py
+@@ -1010,7 +1010,7 @@
+             if b.wiggle_tail:
+                 b.wiggle.position = h_pos + rest_dir * world_rest_length
+             
+-            update_matrix(b, True)
++            update_matrix(b)
+         return
+ 
+     # ================================
+@@ -1121,7 +1121,9 @@
+     else:
+         b.wiggle.position_head = h_pos_anim
+             
+-    update_matrix(b, True)
++    # Only publish the pose after all distance constraints have converged.
++    # Writing it here makes later bones read a mixture of input and output poses.
++    update_matrix(b)
+ 
+ 
+ 
+@@ -1146,7 +1148,7 @@
+         Fs = s * stiff / iterations
+         if (Fs * dt * dt).length > s.length:
+             return s
+-        return Fs * dt
++        return Fs * dt * dt
+     
+     def stretch(target, position, fac):
+         s = target - position
+@@ -1174,9 +1176,12 @@
+                 b.wiggle.position_head += s * (1 - fac)
+             else:
+                 b.wiggle.position_head += s
+-            # [Key fix] Blender 5.0 scale runaway prevention: force scale to (1,1,1) unconditionally
++            # Use the animated world scale, including the armature transform.
++            # Inheriting the simulated parent's stretch here feeds it back into
++            # the spring target; unit scale also breaks scaled armatures.
+             loc, rot, _ = mat.decompose()
+-            mat = Matrix.LocRotScale(b.wiggle.position_head, rot, Vector((1.0, 1.0, 1.0)))
++            reference_scale = (b.id_data.matrix_world @ b.matrix).to_scale()
++            mat = Matrix.LocRotScale(b.wiggle.position_head, rot, reference_scale)
+             target = mat @ Vector((0, b.bone.length, 0))
+             
+             if b.wiggle_tail:
+@@ -1190,9 +1195,9 @@
+             else:
+                 b.wiggle.position = target
+         else:
+-            # [Key fix] Use Vector((1,1,1)) instead of b.matrix.decompose()[2]
+             loc, rot, _ = mat.decompose()
+-            mat = Matrix.LocRotScale(loc, rot, Vector((1.0, 1.0, 1.0)))
++            reference_scale = (b.id_data.matrix_world @ b.matrix).to_scale()
++            mat = Matrix.LocRotScale(loc, rot, reference_scale)
+             target = mat @ Vector((0, b.bone.length, 0))
+             s = spring(target, b.wiggle.position, b.wiggle_stiff)
+             
+@@ -1298,9 +1303,6 @@
+         if update_p:
+             collide(p, dg)
+             update_matrix(p)
+-            # Blender 5.0 forced normalization
+-            p.matrix = p.matrix.to_3x3().normalized().to_4x4()
+-            p.matrix.translation = p.matrix.translation
+             
+         if b.wiggle_tail:
+             pin(b)
+@@ -1309,9 +1311,6 @@
+             collide(b, dg, True)
+             
+     update_matrix(b)
+-    # Blender 5.0 forced normalization
+-    b.matrix = b.matrix.to_3x3().normalized().to_4x4()
+-    b.matrix.translation = b.matrix.translation
+ # END OF REVISION #
+ 
+ 
+@@ -1446,6 +1445,11 @@
+             ob = scene.objects.get(wo.name)
+             if not ob: continue
+             active_ob = not ob.wiggle_mute and not getattr(ob, "wiggle_freeze", False)
++            # Baked/frozen and muted armatures belong to animation evaluation.
++            # The fallback reset below writes channels too, so skipping only
++            # the main simulation loop still corrupts their first baked frame.
++            if not active_ob:
++                continue
+             # Disk cache: jumping back to a frame that's already cached
+             # loads it instead of resetting (the point of a scrub cache).
+             if (cache_on and active_ob and wiggle_cache.has_frame(scene, ob.name, cf)):

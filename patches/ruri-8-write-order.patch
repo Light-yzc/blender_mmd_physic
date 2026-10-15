@@ -1,0 +1,57 @@
+diff --git a/blender_host/runtime.py b/blender_host/runtime.py
+index 4e40e2b..4d15292 100644
+--- a/blender_host/runtime.py
++++ b/blender_host/runtime.py
+@@ -825,21 +825,17 @@ def run_frame(scene, frame_delta_time):
+ 
+     _last_display = collected
+     _solve_pose_writes(collected)
++    flush_pose_writes(POSE_WRITE_REFRESH)
+ 
+ 
+-DEFERRED_WRITE_REASON = (
+-    "the solved pose is computed in the frame change handler and written into the armature "
+-    "at the start of the next frame rather than at the end of this one, because a write "
+-    "after the frame has been evaluated is a second evaluation: blender re-poses the rig "
+-    "and re-runs every modifier stack that depends on it, and a stack is re-run from its "
+-    "first modifier whatever the change was, so a mirror sitting in front of an armature "
+-    "modifier is rebuilt a second time for a change that only moved bones. Writing before "
+-    "the frame is evaluated folds the pose into the evaluation the frame was going to do "
+-    "anyway -- one evaluation instead of two, measured here as 11.6 of the 15.9 "
+-    "milliseconds a frame took. The cloth is therefore one frame behind the animation, "
+-    "which at any playback rate is smaller than the delay of the solver itself, and the "
+-    "bake asks for the flush explicitly because it samples the pose the instant the frame "
+-    "is set and cannot wait for a frame that never comes")
++POSE_WRITE_ORDER_REASON = (
++    "the previous solver output is released before animation is evaluated, and the new "
++    "output is published after that evaluation. Publishing in frame_change_pre lets "
++    "animation curves overwrite every keyed component, so a solver can run correctly "
++    "without moving the visible rig. Publishing after animation requires an OBJECT "
++    "refresh to update the evaluated rig and its meshes. Releasing before the next "
++    "evaluation also keeps unkeyed bones and attached colliders from feeding the last "
++    "simulation result back into the animation input")
+ 
+ 
+ def _solve_pose_writes(collected):
+@@ -1060,19 +1056,10 @@ def forget_body(obj):
+     _last_display = None
+ 
+ 
+-PRE_FRAME_TAG_REASON = (
+-    "the flush announces the change even though it runs before the frame is evaluated, "
+-    "because writing the plane through foreach_set does not invalidate anything on its own "
+-    "-- the basis reads back correctly and the evaluated pose does not move, which is the "
+-    "same silence that made a still timeline stop updating. Announcing here is free: the "
+-    "evaluation that consumes the tag is the one the frame change was going to run anyway, "
+-    "so the rig is posed once. Announcing after the frame, which is where this used to "
+-    "happen, is what cost a second evaluation of every modifier stack hanging off the rig")
+-
+-
+ @persistent
+ def _on_frame_change_pre(scene, depsgraph=None):
+-    flush_pose_writes(POSE_WRITE_REFRESH)
++    _pending_writes.clear()
++    release_driven_pose(scene)
+ 
+ 
+ @persistent
