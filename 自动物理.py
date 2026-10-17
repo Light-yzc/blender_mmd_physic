@@ -1,7 +1,7 @@
 bl_info = {
     "name": "骨骼链阻尼追踪",
     "author": "WANG",
-    "version": (5, 38),
+    "version": (5, 39),
     "blender": (3, 0, 0),
     "location": "View3D > 侧边栏(N) > 骨骼链",
     "description": "Wiggle/Ruri 实时物理、碰撞、骨骼区间烘焙与原动作恢复",
@@ -2589,8 +2589,9 @@ def _ruri_bake_range(context, arm, start, end, preroll):
             failure = getattr(runtime, '_handler_failure', None)
             if failure is not None:
                 raise RuntimeError(f"第 {current_frame} 帧 Ruri 求解失败：{failure}")
-            runtime.flush_pose_writes(runtime.POSE_WRITE_REFRESH)
-            view_layer.update()
+            # The frame-change handler has already written matrix_basis.
+            # Sampling those channels needs no second geometry evaluation.
+            runtime.flush_pose_writes(None)
             if current_frame >= start:
                 for bone, prop, indices in specs:
                     values = (tuple(bone.rotation_axis_angle) if prop == 'rotation_axis_angle'
@@ -3056,7 +3057,104 @@ def _physics_bake_source(arm, kinds):
     return action, handle, influence, blend
 
 
+def _bake_input_visibility(context, jobs):
+    """Suspend downstream mesh evaluation; retain all declared solver inputs.
+
+    Use Blender's ID dependency map, including constraints, drivers, node trees
+    and collection references. Never change modifier or cache configuration.
+    Unknown scripted driver dependencies fall back to the complete scene.
+    """
+    import importlib
+    roots = {arm for _kind, arm in jobs}
+    scene = context.scene
+    if scene.camera:
+        roots.add(scene.camera)
+    if hasattr(scene, 'ruri_cloth_physics'):
+        world = importlib.import_module('RuriClothPhysics.blender_host.world')
+        roots.update(obj for obj, _settings in world.scene_colliders(scene))
+        roots.update(world.winds(scene))
+        roots.update(world.bodies(scene))
+    # Scene-level drivers can feed global solver parameters. Keep their
+    # explicit targets without traversing scene -> every scene object.
+    scene_animation = scene.animation_data
+    if scene_animation:
+        for fc in scene_animation.drivers:
+            if fc.mute:
+                continue
+            driver = fc.driver
+            if driver.type == 'SCRIPTED' and not driver.is_simple_expression:
+                print('[BoneChain] 场景自定义驱动器依赖无法静态确认，保留完整场景求值', flush=True)
+                return lambda: None
+            roots.update(target.id for variable in driver.variables for target in variable.targets
+                         if target.id is not None and not isinstance(target.id, bpy.types.Scene))
+    # Wiggle guides are resolved by name rather than an ID pointer.
+    for _kind, arm in jobs:
+        for bone in arm.pose.bones:
+            guide = bpy.data.objects.get('WGuide_' + bone.name)
+            if guide:
+                roots.add(guide)
+    dependencies = {}
+    for used, users in bpy.data.user_map().items():
+        if isinstance(used, bpy.types.Scene):
+            continue
+        for user in users:
+            dependencies.setdefault(user, set()).add(used)
+    retained, pending = set(), list(roots)
+    while pending:
+        item = pending.pop()
+        if item in retained:
+            continue
+        retained.add(item)
+        animation = getattr(item, 'animation_data', None)
+        if animation and any(fc.driver.type == 'SCRIPTED' and not fc.driver.is_simple_expression
+                             for fc in animation.drivers if not fc.mute):
+            print('[BoneChain] 自定义驱动器依赖无法静态确认，保留完整场景求值', flush=True)
+            return lambda: None
+        pending.extend(dependencies.get(item, set()) - retained)
+    # Native simulators can read scene-wide effectors without explicit ID
+    # links. If a solver input itself uses one, preserve full scene evaluation.
+    native_simulators = {'CLOTH', 'SOFT_BODY', 'FLUID', 'DYNAMIC_PAINT', 'PARTICLE_SYSTEM'}
+    if any(isinstance(item, bpy.types.Object) and item.type == 'MESH'
+           and any(mod.type in native_simulators for mod in item.modifiers) for item in retained):
+        print('[BoneChain] 物理输入含场景级模拟，保留完整场景求值', flush=True)
+        return lambda: None
+    suspended = [obj for obj in context.view_layer.objects
+                 if obj.type == 'MESH' and obj not in retained and not obj.hide_viewport
+                 and obj.is_editable]
+    print(f'[BoneChain] 采样期间暂缓更新 {len(suspended)} 个下游网格；保留 {len(retained)} 个输入数据块', flush=True)
+    changed = []
+    try:
+        for obj in suspended:
+            selected = obj.select_get()
+            obj.hide_viewport = True
+            changed.append((obj, selected))
+    except BaseException:
+        for obj, selected in reversed(changed):
+            obj.hide_viewport = False
+            obj.select_set(selected)
+        raise
+    def restore():
+        for obj, selected in reversed(changed):
+            obj.hide_viewport = False
+            obj.select_set(selected)
+    return restore
+
+
 def _all_physics_bake_range(context, start, end, preroll, armature_name=''):
+    jobs = _physics_bake_jobs(context)
+    if armature_name:
+        jobs = [(kind, arm) for kind, arm in jobs if arm.name == armature_name]
+    if not jobs:
+        raise RuntimeError('场景中没有启用的插件物理配置')
+    restore_visibility = _bake_input_visibility(context, jobs)
+    try:
+        return (yield from _all_physics_bake_range_impl(context, start, end, preroll, armature_name))
+    finally:
+        # Also runs for Esc, errors and worker cancellation before saving.
+        restore_visibility()
+
+
+def _all_physics_bake_range_impl(context, start, end, preroll, armature_name=''):
     import importlib
     jobs = _physics_bake_jobs(context)
     if armature_name:

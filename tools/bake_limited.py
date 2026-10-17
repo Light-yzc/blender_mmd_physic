@@ -82,6 +82,10 @@ def worker(job_path, stage):
         path.write_text(json.dumps(job, ensure_ascii=False, indent=2))
     else:
         index, count = int(stage), len(job['stages'])
+        props = scene.bonechain_props
+        props.native_cloth_start = job['start']
+        props.native_cloth_end = job['end']
+        props.native_cloth_preroll = job['preroll']
         obj = bpy.data.objects[job['stages'][index]['object']]
         emit_progress(0.05 + 0.9 * index / count, '准备全部物理求解：' + obj.name)
         last_sent = [0.0]

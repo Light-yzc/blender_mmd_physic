@@ -1,0 +1,53 @@
+{
+  "date": "2026-10-17",
+  "blender": "5.2.2 LTS d13f752e3b9c",
+  "gpu": "RTX 4090 / CUDA",
+  "scene": "test11-physics-baked.blend",
+  "range": [
+    600,
+    629
+  ],
+  "preroll": 5,
+  "cgroup_memory_max_gib": 4,
+  "method": "Separate background processes, cProfile enabled in both, excludes file load/save and GUI redraw",
+  "ruri_178_bones": {
+    "before_seconds": 67.63729176600009,
+    "after_seconds": 1.862378099000125,
+    "speedup": 36.317701438989886,
+    "time_reduction_percent": 97.2465217775968,
+    "before_peak_rss_mib": 2809.640625,
+    "after_peak_rss_mib": 1428.61328125,
+    "compared_key_records": 1057673,
+    "exact_match": true,
+    "max_value_error": 0.0,
+    "shape_errors": []
+  },
+  "wiggle_32_bone_fixture": {
+    "before_seconds": 0.23733687000003556,
+    "after_seconds": 0.23481726299996808,
+    "speedup": 1.0107300756676814,
+    "time_reduction_percent": 1.0616163430768655,
+    "before_peak_rss_mib": 1046.9609375,
+    "after_peak_rss_mib": 1048.76953125,
+    "compared_key_records": 10255,
+    "exact_match": true,
+    "max_value_error": 0.0,
+    "shape_errors": []
+  },
+  "checks": {
+    "visibility_restored": true,
+    "scripted_driver_fallback": true,
+    "error_cleanup": true,
+    "native_input_fallback": true
+  },
+  "cancel_restores_action_and_visibility": true,
+  "limited_pipeline_passed": true,
+  "limited_test_output": "test11-physics-baked-limited-bake-ffc311c6e76d.blend",
+  "limited_test_range": [
+    600,
+    629
+  ],
+  "limited_test_preroll": 30,
+  "limited_continuous_simulation_start": -30,
+  "raw_local_artifacts": "/home/regen/code/blender-physics-repair-20261017/bake-performance"
+}
