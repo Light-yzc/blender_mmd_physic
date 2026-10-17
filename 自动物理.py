@@ -1,7 +1,7 @@
 bl_info = {
     "name": "骨骼链阻尼追踪",
     "author": "WANG",
-    "version": (5, 33),
+    "version": (5, 34),
     "blender": (3, 0, 0),
     "location": "View3D > 侧边栏(N) > 骨骼链",
     "description": "骨骼链物理、碰撞与细分，支持 Wiggle/Ruri 区间烘焙和恢复原动作",
@@ -475,9 +475,6 @@ class BoneChainProps(PropertyGroup):
         get=lambda self: self.get('native_cloth_end', self.id_data.frame_end),
         set=lambda self, value: self.__setitem__('native_cloth_end', value))
     native_cloth_preroll: IntProperty(name='预模拟帧数', default=30, min=0, max=10000)
-    native_cloth_isolate: BoolProperty(
-        name='独立进程烘焙（节点布料／Linux）', default=True,
-        description='逐对象启动 Blender，限制工作进程内存；读取已保存工程，结果另存新副本')
     native_cloth_memory_gb: IntProperty(name='工作进程内存上限 (GiB)', default=8, min=2, max=1024)
     native_cloth_bake_bones: BoolProperty(
         name='先烘焙上游 Ruri／Wiggle', default=True,
@@ -3207,7 +3204,7 @@ class BONECHAIN_OT_native_cloth_range(Operator):
 
 class BONECHAIN_OT_native_cloth_bake_isolated(Operator):
     bl_idname = 'bonechain.native_cloth_bake_isolated'
-    bl_label = '独立进程烘焙场景布料'
+    bl_label = '内存受限烘焙'
     bl_description = '按依赖顺序逐对象烘焙，限制工作进程内存，结果写入新工程副本；仅支持 Linux 节点布料'
 
     def execute(self, context):
@@ -3289,12 +3286,10 @@ class BONECHAIN_OT_native_cloth_bake_isolated(Operator):
 
 class BONECHAIN_OT_native_cloth_bake(_BoneChainBakeModal, Operator):
     bl_idname = 'bonechain.native_cloth_bake'
-    bl_label = '按依赖顺序烘焙场景布料'
-    bl_description = '自动找到启用的原生布料，先烘焙上游骨架，再按碰撞和代理依赖重新烘焙；保留原动作'
+    bl_label = '正常烘焙'
+    bl_description = '在当前 Blender 中按依赖顺序烘焙骨架和原生布料；没有进程内存上限，保留原动作'
 
     def execute(self, context):
-        if not bpy.app.background and context.scene.bonechain_props.native_cloth_isolate:
-            return bpy.ops.bonechain.native_cloth_bake_isolated('EXEC_DEFAULT')
         if _BONECHAIN_BAKE_OWNER is not None or _native_modal_running(context):
             self.report({'WARNING'}, '已有烘焙在运行，请等待完成或中止')
             return {'CANCELLED'}
@@ -3640,17 +3635,18 @@ class BONECHAIN_PT_panel(Panel):
             row.prop(props, 'native_cloth_start')
             row.prop(props, 'native_cloth_end')
             native.prop(props, 'native_cloth_preroll')
-            native.prop(props, 'native_cloth_isolate')
-            if props.native_cloth_isolate:
-                native.prop(props, 'native_cloth_memory_gb')
-                native.label(text='先保存工程；结果另存副本', icon='INFO')
             native.prop(props, 'native_cloth_bake_bones')
             if props.native_cloth_bake_bones:
                 native.label(text='上游骨架中的启用组会一起烘焙', icon='INFO')
             native.operator('bonechain.native_cloth_range', icon='TIME')
             native.label(text='骨骼物理 → 上游布料 → 下游布料', icon='SORTTIME')
             native.label(text='磁盘缓存 · 逐对象烘焙', icon='DISK_DRIVE')
-            native.operator('bonechain.native_cloth_bake', icon='RENDER_ANIMATION')
+            native.operator('bonechain.native_cloth_bake', text='正常烘焙', icon='RENDER_ANIMATION')
+            limited = native.box()
+            limited.prop(props, 'native_cloth_memory_gb')
+            limited.label(text='节点布料／Linux · 先保存工程', icon='INFO')
+            limited.operator('bonechain.native_cloth_bake_isolated', text='内存受限烘焙', icon='RENDER_ANIMATION')
+            limited.label(text='独立进程；结果另存副本')
             native.operator('bonechain.native_cloth_delete', icon='TRASH')
         if not (obj and obj.type == 'ARMATURE' and context.mode == 'POSE'):
             layout.label(text="请在姿态模式下操作", icon='INFO')
