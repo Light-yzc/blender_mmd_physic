@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Bake native node cloth in sequential, memory-limited Blender processes (Linux).
+"""Bake only Ruri/Wiggle bone physics in a RAM-limited Blender process (Linux).
 
-Use a saved project with disk caches, preferably an externalized copy. Each
-object is simulated continuously for the entire requested range, never split
-into independent time segments. Original project and existing caches are kept.
+The complete interval is simulated continuously. Outputs are animation actions
+saved in a separate .blend copy. Native Cloth and its cache settings are never
+configured, baked, deleted or toggled by this tool.
 """
 import argparse
-import hashlib
 import importlib
 import json
 import os
@@ -52,7 +51,7 @@ def reveal_object(context, obj):
 
 def worker(job_path, stage):
     import bpy
-    module = plugin()
+    plugin()
     path = Path(job_path)
     job = json.loads(path.read_text())
     scene = bpy.data.scenes[job['scene']] if job.get('scene') else bpy.context.scene
@@ -60,113 +59,39 @@ def worker(job_path, stage):
         bpy.context.window.scene = scene
     if scene != bpy.context.scene:
         raise RuntimeError('无法激活计划中的场景')
+    obj = bpy.data.objects.get(job.get('armature', ''))
+    if not obj or obj.type != 'ARMATURE' or obj.name not in scene.objects:
+        raise RuntimeError('找不到指定骨架')
     if stage == 'plan':
         props = scene.bonechain_props
-        scope = job.get('scope', 'SCENE')
-        if scope == 'SCENE':
-            layers, arms = module._native_cloth_plan(bpy.context)
-            if not layers:
-                raise RuntimeError('没有启用的原生布料')
-            targets = [obj for layer in layers for obj in layer]
-            if any(mod.type != 'NODES' for obj in targets
-                   for mod in module._native_cloth_modifiers(obj)):
-                raise RuntimeError('隔离场景烘焙目前仅支持节点布料，场景包含传统 Cloth。')
-            jobs = module._native_cloth_bone_jobs(bpy.context, arms, props.native_cloth_bake_bones)
-        else:
-            arm = bpy.data.objects.get(job.get('armature', ''))
-            if not arm or arm.type != 'ARMATURE' or arm.name not in scene.objects:
-                raise RuntimeError('找不到指定骨架')
-            # Bone-only bake never requires cloth, nor evaluates its caches.
-            targets = [obj for obj in scene.objects if module._native_cloth_modifiers(obj)]
-            jobs = [('Ruri' if scope == 'RURI' else 'Wiggle', arm)]
-        start = job.get('start')
-        end = job.get('end')
-        start = props.native_cloth_start if start is None else start
-        end = props.native_cloth_end if end is None else end
+        start = props.native_cloth_start if job['start'] is None else job['start']
+        end = props.native_cloth_end if job['end'] is None else job['end']
         if end < start:
             raise RuntimeError('结束帧早于起始帧')
-        job.update(scene=scene.name,
-                   start=max(-1048574, start - props.native_cloth_preroll) if scope == 'SCENE' else start,
-                   preroll=props.native_cloth_preroll, end=end,
-                   modifiers=[{'object':obj.name, 'modifier':mod.name,
-                               'visible':mod.show_viewport}
-                              for obj in targets for mod in module._native_cloth_modifiers(obj)],
-                   stages=([{'kind':kind, 'object':arm.name} for kind, arm in jobs]
-                           + ([{'kind':'cloth', 'object':obj.name} for obj in targets] if scope == 'SCENE' else [])))
+        job.update(scene=scene.name, start=start, end=end, preroll=props.native_cloth_preroll,
+                   stages=[{'kind':job['scope'], 'object':obj.name}])
         path.write_text(json.dumps(job, ensure_ascii=False, indent=2))
     else:
-        task = job['stages'][int(stage)]
-        obj = bpy.data.objects[task['object']]
-        records = job['modifiers']
-        # Completed upstream cloth stays enabled; all future cloth is paused.
-        done = {t['object'] for t in job['stages'][:int(stage)] if t['kind'] == 'cloth'}
-        for record in records:
-            owner = bpy.data.objects[record['object']]
-            mod = owner.modifiers[record['modifier']]
-            mod.show_viewport = record['visible'] and (owner.name in done or
-                                   (task['kind'] == 'cloth' and owner == obj))
         restore_visibility = reveal_object(bpy.context, obj)
         try:
             if bpy.context.object and bpy.context.object.mode != 'OBJECT':
                 bpy.ops.object.mode_set(mode='OBJECT')
             bpy.context.view_layer.objects.active = obj
-            if task['kind'] in {'Ruri', 'Wiggle'}:
-                if job.get('scope', 'SCENE') != 'SCENE':
-                    with bpy.context.temp_override(object=obj, active_object=obj):
-                        if task['kind'] == 'Ruri':
-                            result = bpy.ops.bonechain.ruri_bake('EXEC_DEFAULT',
-                                frame_start=job['start'], frame_end=job['end'], preroll=job['preroll'])
-                        else:
-                            result = bpy.ops.bonechain.wiggle_bake('EXEC_DEFAULT',
-                                frame_start=job['start'], frame_end=job['end'])
-                    if 'FINISHED' not in result:
-                        raise RuntimeError('骨架烘焙未完成')
+            with bpy.context.temp_override(object=obj, active_object=obj):
+                if job['scope'] == 'RURI':
+                    if not bpy.ops.bonechain.ruri_bake.poll():
+                        raise RuntimeError('当前骨架没有可用的 Ruri 配置')
+                    result = bpy.ops.bonechain.ruri_bake('EXEC_DEFAULT', frame_start=job['start'],
+                        frame_end=job['end'], preroll=job['preroll'])
                 else:
-                    generator = (module._ruri_bake_range(bpy.context, obj, job['start'], job['end'], 0)
-                                 if task['kind'] == 'Ruri' else
-                                 module._wiggle_bake_range(bpy.context, obj, job['start'], job['end']))
-                    try:
-                        for progress in generator:
-                            print('BONE_PROGRESS', round(progress * 100, 1), flush=True)
-                    finally:
-                        generator.close()
-            else:
-                obj.use_simulation_cache = True
-                for record in records:
-                    if record['object'] != obj.name:
-                        continue
-                    mod = obj.modifiers[record['modifier']]
-                    mod.bake_target = 'DISK'
-                    token = hashlib.sha256((obj.name + '\0' + mod.name).encode()).hexdigest()[:20]
-                    for bake in mod.bakes:
-                        # A unique job directory ensures deleting/rebaking this
-                        # bake cannot remove the source project's cache files.
-                        bake.use_custom_path = True
-                        bake.directory = job['cache_root'] + '/' + token + '/' + str(bake.bake_id)
-                        bake.bake_target = 'DISK'
-                        bake.use_custom_simulation_frame_range = True
-                        bake.frame_start, bake.frame_end = job['start'], job['end']
-                        with bpy.context.temp_override(object=obj, active_object=obj):
-                            result = bpy.ops.object.geometry_node_bake_delete_single(
-                                session_uid=obj.session_uid, modifier_name=mod.name, bake_id=bake.bake_id)
-                            if 'FINISHED' not in result:
-                                raise RuntimeError('清理目标缓存失败：' + obj.name)
-                            bpy.context.scene.frame_set(job['start'])
-                            result = bpy.ops.object.geometry_node_bake_single(
-                                'EXEC_DEFAULT', session_uid=obj.session_uid,
-                                modifier_name=mod.name, bake_id=bake.bake_id)
-                            if 'FINISHED' not in result:
-                                raise RuntimeError('烘焙失败：' + obj.name)
-                        meta = Path(bpy.path.abspath(bake.directory)) / 'meta'
-                        for frame in range(job['start'], job['end'] + 1):
-                            if not (meta / f'{frame:05d}_00000.json').is_file():
-                                raise RuntimeError(f'{obj.name} 烘焙未完整结束，缺少帧 {frame}')
+                    if not bpy.ops.bonechain.wiggle_bake.poll():
+                        raise RuntimeError('当前骨架不可执行 Wiggle 烘焙')
+                    result = bpy.ops.bonechain.wiggle_bake('EXEC_DEFAULT', frame_start=job['start'],
+                        frame_end=job['end'])
+            if 'FINISHED' not in result:
+                raise RuntimeError('骨架烘焙未完成，原工程保留')
         finally:
             restore_visibility()
-            for record in records:
-                bpy.data.objects[record['object']].modifiers[record['modifier']].show_viewport = record['visible']
-    # Each successful stage creates the input for the next process. Source file
-    # is never overwritten. Disable backup copies only in this worker process.
     bpy.context.preferences.filepaths.save_version = 0
     bpy.ops.wm.save_as_mainfile(filepath=job['output'], compress=True)
     print('CHECKPOINT', job['output'], flush=True)
@@ -179,8 +104,8 @@ def main():
     parser.add_argument('--start', type=int)
     parser.add_argument('--end', type=int)
     parser.add_argument('--memory-limit', default='8G')
-    parser.add_argument('--scope', choices=['SCENE', 'RURI', 'WIGGLE'], default='SCENE')
-    parser.add_argument('--armature', default='')
+    parser.add_argument('--scope', choices=['RURI', 'WIGGLE'], default='RURI')
+    parser.add_argument('--armature', required=True)
     args = parser.parse_args()
     source = args.project.resolve()
     blender = shutil.which(args.blender)
@@ -193,7 +118,7 @@ def main():
     output = source.with_name(stem + '.blend')
     job_path = source.with_name(stem + '.json')
     job = {'source':str(source), 'output':str(output), 'start':args.start,
-           'end':args.end, 'scope':args.scope, 'armature':args.armature, 'cache_root':'//' + stem + '_physics_cache'}
+           'end':args.end, 'scope':args.scope, 'armature':args.armature}
     job_path.write_text(json.dumps(job, ensure_ascii=False, indent=2))
     script = str(Path(__file__).resolve())
     match = re.fullmatch(r'(\d+)([KMGT]?)(?:i?B)?', args.memory_limit, re.IGNORECASE)
@@ -210,7 +135,7 @@ def main():
             print('可用内存不足，未启动烘焙工作进程。', file=sys.stderr)
             return 1
         print(f'本阶段硬上限 {limit // (1024 * 1024)} MiB', flush=True)
-        unit = f'blender-cloth-bake-{os.getpid()}-{stage}'
+        unit = f'blender-physics-bake-{os.getpid()}-{stage}'
         cmd = ['systemd-run', '--user', '--wait', '--pipe', '--collect', '--quiet',
                '--unit=' + unit, '-p', 'MemoryMax=' + str(limit),
                '-p', 'MemorySwapMax=0', blender, '--background', str(input_file),
@@ -229,14 +154,13 @@ def main():
         code = run(output, index)
         if code:
             print('任务已停止；原工程保留。已完成阶段在 ' + str(output)
-                  + '；失败阶段缓存可能不完整，不自动继续。', file=sys.stderr)
+                  + '；失败阶段未完成，不自动继续。', file=sys.stderr)
             return code
     print('完成：' + str(output))
     return 0
 
 
 if __name__ == '__main__':
-    raise SystemExit('5.36 已暂时撤下所有插件烘焙功能，此工具当前不执行任务。')
     if '--' in sys.argv and '--worker' in sys.argv[sys.argv.index('--') + 1:]:
         params = sys.argv[sys.argv.index('--') + 1:]
         worker(params[1], params[2])

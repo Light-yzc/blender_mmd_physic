@@ -1,10 +1,10 @@
 bl_info = {
     "name": "骨骼链阻尼追踪",
     "author": "WANG",
-    "version": (5, 36),
+    "version": (5, 37),
     "blender": (3, 0, 0),
     "location": "View3D > 侧边栏(N) > 骨骼链",
-    "description": "骨骼链物理、碰撞与细分，配置 Wiggle/Ruri 实时模拟",
+    "description": "Wiggle/Ruri 实时物理、碰撞、骨骼区间烘焙与原动作恢复",
     "category": "Rigging",
 }
 
@@ -463,14 +463,14 @@ class ChainGroup(PropertyGroup):
 class BoneChainProps(PropertyGroup):
     groups: CollectionProperty(type=ChainGroup)
     group_index: IntProperty(default=0)
+    # Keep legacy range keys so saved plugin bake ranges remain available.
     native_cloth_open: BoolProperty(
-        name='烘焙', default=False, options={'SKIP_SAVE'},
+        name='插件物理烘焙', default=False, options={'SKIP_SAVE'},
         description='展开或折叠统一烘焙设置')
-    native_cloth_scope: EnumProperty(
-        name='烘焙对象', default='SCENE',
-        items=[('SCENE', '场景布料（含上游骨架）', '按依赖顺序处理场景布料和上游骨架'),
-               ('RURI', 'Ruri（当前骨架）', '仅烘焙当前绑定骨架的全部启用 Ruri 分组'),
-               ('WIGGLE', 'Wiggle（当前骨架）', '仅烘焙当前骨架启用的 Wiggle 骨骼')])
+    physics_bake_scope: EnumProperty(
+        name='烘焙类型', default='RURI',
+        items=[('RURI', 'Ruri', '当前绑定骨架全部启用的 Ruri 配置'),
+               ('WIGGLE', 'Wiggle', '当前骨架启用的 Wiggle 骨骼')])
     native_cloth_start: IntProperty(
         name='起始帧', min=-1048574, max=1048574,
         get=lambda self: self.get('native_cloth_start', self.id_data.frame_start),
@@ -481,9 +481,6 @@ class BoneChainProps(PropertyGroup):
         set=lambda self, value: self.__setitem__('native_cloth_end', value))
     native_cloth_preroll: IntProperty(name='预模拟帧数', default=30, min=0, max=10000)
     native_cloth_memory_gb: IntProperty(name='工作进程内存上限 (GiB)', default=8, min=2, max=1024)
-    native_cloth_bake_bones: BoolProperty(
-        name='先烘焙上游 Ruri／Wiggle', default=True,
-        description='先按骨架烘焙布料上游的全部启用 Ruri 配置／Wiggle 骨骼，再烘焙布料；保留原动作恢复记录')
     subdiv_count: IntProperty(
         name="细分段数", default=4, min=2, max=32,
         description="把每根选中骨骼切成几段")
@@ -3011,192 +3008,16 @@ class BONECHAIN_OT_wiggle_cancel_bake(Operator):
 
 
 # ===============================================================
-# 场景原生布料：先骨骼，再按碰撞/代理依赖逐层烘焙。
+# 插件骨骼物理烘焙：只处理 Ruri / Wiggle。
 # ===============================================================
-def _native_cloth_modifiers(obj, enabled_only=True):
-    if enabled_only and obj.hide_viewport:
-        return []
-    found = []
-    for mod in obj.modifiers:
-        if enabled_only and not mod.show_viewport:
-            continue
-        if mod.type == 'CLOTH':
-            found.append(mod)
-        elif mod.type == 'NODES' and mod.node_group and getattr(mod, 'bakes', None):
-            label = (mod.name + ' ' + mod.node_group.name).casefold()
-            if 'cloth' in label or '布料' in label:
-                found.append(mod)
-    return found
-
-
-def _native_cloth_use_disk_cache(obj, mod):
-    # Explicit per-bake targets are necessary: INHERIT defaults to PACKED in Blender.
-    if mod.type == 'CLOTH':
-        cache = mod.point_cache
-        cache.use_disk_cache = True
-        return
-    mod.bake_target = 'DISK'
-    project = bpy.path.clean_name(bpy.path.display_name_from_filepath(bpy.data.filepath))
-    token = hashlib.sha256((obj.name + '\0' + mod.name).encode('utf-8')).hexdigest()[:20]
-    for bake in mod.bakes:
-        bake.bake_target = 'DISK'
-        bake.use_custom_path = True
-        bake.directory = f'//{project}_physics_cache/{token}/{bake.bake_id}'
-
-
-def _cloth_object_sources(obj, scene):
-    sources = {}
-    def add(value):
-        if isinstance(value, bpy.types.Object):
-            sources[value.name] = value
-        elif isinstance(value, bpy.types.Collection):
-            for child in value.all_objects:
-                sources[child.name] = child
-    add(obj.parent)
-    for constraint in obj.constraints:
-        if not constraint.mute:
-            add(getattr(constraint, 'target', None))
-    for mod in obj.modifiers:
-        if not mod.show_viewport:
-            continue
-        for prop in mod.bl_rna.properties:
-            if prop.type == 'POINTER' and prop.identifier not in {'rna_type', 'node_group'}:
-                add(getattr(mod, prop.identifier, None))
-        if mod.type == 'CLOTH' and mod.collision_settings.use_collision:
-            collection = mod.collision_settings.collection
-            if collection:
-                for other in collection.all_objects:
-                    if other != obj:
-                        add(other)
-            else:
-                for other in scene.objects:
-                    if other != obj and any(m.type == 'COLLISION' and m.show_viewport for m in other.modifiers):
-                        add(other)
-        if mod.type == 'NODES' and mod.node_group:
-            inputs = getattr(getattr(mod, 'properties', None), 'inputs', None)
-            for socket in mod.node_group.interface.items_tree:
-                if socket.item_type != 'SOCKET' or socket.in_out != 'INPUT':
-                    continue
-                binding = getattr(inputs, socket.identifier, None) if inputs else None
-                if binding is not None:
-                    add(getattr(binding, 'value', None))
-                else:
-                    try:
-                        add(mod.get(socket.identifier))
-                    except TypeError:
-                        pass
-            visited = set()
-            def visit_tree(tree):
-                if tree.as_pointer() in visited:
-                    return
-                visited.add(tree.as_pointer())
-                for node in tree.nodes:
-                    if node.type == 'GROUP' and node.node_tree:
-                        visit_tree(node.node_tree)
-                    for socket in node.inputs:
-                        if not socket.is_linked:
-                            add(getattr(socket, 'default_value', None))
-            visit_tree(mod.node_group)
-    return list(sources.values())
-
-
-def _native_cloth_plan(context):
-    scene = context.scene
-    targets = {obj.name: obj for obj in scene.objects if _native_cloth_modifiers(obj)}
-    dependencies = {name: set() for name in targets}
-    routes = {}
-    armatures = {}
-    for name, obj in targets.items():
-        if obj.name not in context.view_layer.objects:
-            raise RuntimeError(f'布料「{name}」所在集合被当前视图层排除，请先启用该集合')
-        if not obj.is_editable:
-            raise RuntimeError(f'布料「{name}」不可编辑，请先创建库覆盖或本地副本')
-        cloth_mods = _native_cloth_modifiers(obj)
-        if any(mod.type == 'NODES' for mod in cloth_mods):
-            if any(mod.type == 'CLOTH' for mod in cloth_mods):
-                raise RuntimeError(f'「{name}」同时叠加传统和节点布料，请先拆分模拟对象以明确修改器顺序')
-            if any(mod.type == 'NODES' and mod.show_viewport and getattr(mod, 'bakes', None)
-                   and mod not in cloth_mods for mod in obj.modifiers):
-                raise RuntimeError(f'「{name}」还包含其他几何节点模拟，不能只用对象级 Bake 隔离布料')
-            if any(not mod.show_viewport and mod.type == 'NODES' and getattr(mod, 'bakes', None)
-                   for mod in obj.modifiers):
-                raise RuntimeError(f'「{name}」同时含已停用的节点模拟，请先分离，避免对象级 Bake 重算它')
-        visited = set()
-        def visit(current, path):
-            if current.name in visited:
-                return
-            visited.add(current.name)
-            if current.type == 'ARMATURE':
-                armatures[current.name] = current
-            for source in _cloth_object_sources(current, scene):
-                if source.name in targets:
-                    dependencies[name].add(source.name)
-                    routes[(name, source.name)] = path + [source.name]
-                else:
-                    visit(source, path + [source.name])
-        visit(obj, [obj.name])
-    pending = {name: set(value) for name, value in dependencies.items()}
-    layers = []
-    while pending:
-        ready = sorted(name for name, deps in pending.items() if not deps)
-        if not ready:
-            chain, seen = [], {}
-            current = next(iter(pending))
-            while current not in seen:
-                seen[current] = len(chain)
-                chain.append(current)
-                current = sorted(pending[current])[0]
-            cycle = chain[seen[current]:] + [current]
-            full_cycle = []
-            for first, second in zip(cycle, cycle[1:]):
-                full_cycle.extend(routes[(first, second)][:-1])
-            full_cycle.append(current)
-            raise RuntimeError('布料依赖循环：' + ' → '.join(full_cycle))
-        layers.append([targets[name] for name in ready])
-        for name in ready:
-            del pending[name]
-        for deps in pending.values():
-            deps.difference_update(ready)
-    return layers, list(armatures.values())
-
-
-def _native_cloth_bone_jobs(context, armatures, rebake):
-    import importlib
-    jobs = []
-    world = (importlib.import_module('RuriClothPhysics.blender_host.world')
-             if hasattr(context.scene, 'ruri_cloth_physics') else None)
-    for arm in armatures:
-        body = world.body_entry(context.scene, arm) if world else None
-        ruri = bool(body and any(c.enabled for c in arm.ruri_cloth_physics.configs)
-                    and (body.live or (rebake and _ruri_bake_active(arm))))
-        wiggle = bool(getattr(context.scene, 'wiggle_enable', False)
-                      and getattr(arm, 'wiggle_enable', False)
-                      and not getattr(arm, 'wiggle_mute', True)
-                      and not getattr(arm, 'wiggle_freeze', True)
-                      and any((getattr(b, 'wiggle_head', False) or getattr(b, 'wiggle_tail', False))
-                              and not b.wiggle_mute for b in arm.pose.bones))
-        action = getattr(getattr(arm, 'animation_data', None), 'action', None)
-        if rebake and getattr(arm, 'bonechain_wiggle_bake_saved', False):
-            wiggle = wiggle or (action is not None and action == arm.bonechain_wiggle_bake_output)
-        if not rebake and (ruri or wiggle):
-            raise RuntimeError(f'骨架「{arm.name}」还有实时物理，请开启“先烘焙上游 Ruri／Wiggle”')
-        if ruri and wiggle:
-            raise RuntimeError(f'「{arm.name}」同时运行 Ruri 和 Wiggle，请先分别完成骨骼烘焙，避免互相覆盖动作')
-        if ruri:
-            jobs.append(('Ruri', arm))
-        if wiggle:
-            jobs.append(('Wiggle', arm))
-    return jobs
-
-
 def _native_modal_running(context):
     ids = {'OBJECT_OT_simulation_nodes_cache_bake', 'PTCACHE_OT_bake'}
     return any(getattr(op, 'bl_idname', '') in ids or op.bl_rna.identifier in ids
                for window in context.window_manager.windows for op in getattr(window, 'modal_operators', ()))
 
 
-class BONECHAIN_OT_native_cloth_range(Operator):
-    bl_idname = 'bonechain.native_cloth_range'
+class BONECHAIN_OT_physics_bake_range(Operator):
+    bl_idname = 'bonechain.physics_bake_range'
     bl_label = '使用场景区间'
     bl_options = {'REGISTER', 'UNDO'}
 
@@ -3207,10 +3028,10 @@ class BONECHAIN_OT_native_cloth_range(Operator):
         return {'FINISHED'}
 
 
-class BONECHAIN_OT_native_cloth_bake_isolated(Operator):
-    bl_idname = 'bonechain.native_cloth_bake_isolated'
+class BONECHAIN_OT_physics_bake_isolated(Operator):
+    bl_idname = 'bonechain.physics_bake_isolated'
     bl_label = '内存受限烘焙'
-    bl_description = '按依赖顺序逐对象烘焙，限制工作进程内存，结果写入新工程副本；支持 Linux Ruri／Wiggle 和节点布料'
+    bl_description = '独立进程烘焙当前骨架 Ruri 或 Wiggle，限制内存并另存副本；仅支持 Linux'
 
     def execute(self, context):
         global _BONECHAIN_BAKE_OWNER
@@ -3236,18 +3057,17 @@ class BONECHAIN_OT_native_cloth_bake_isolated(Operator):
             self.report({'ERROR'}, '缺少 bonechain_tools/bake_limited.py，请同时安装隔离烘焙工具目录')
             return {'CANCELLED'}
         props = context.scene.bonechain_props
-        arm = (_ruri_bake_armature(context) if props.native_cloth_scope == 'RURI'
+        arm = (_ruri_bake_armature(context) if props.physics_bake_scope == 'RURI'
                else context.active_object)
-        if props.native_cloth_scope != 'SCENE' and (arm is None or arm.type != 'ARMATURE'):
+        if arm is None or arm.type != 'ARMATURE':
             self.report({'ERROR'}, '请先选择要烘焙的骨架')
             return {'CANCELLED'}
         fd, self._log_path = tempfile.mkstemp(prefix='bonechain-bake-', suffix='.log')
         command = [shutil.which('python3') or '/usr/bin/python3', str(script), bpy.data.filepath,
                    '--blender', bpy.app.binary_path, '--start', str(props.native_cloth_start),
                    '--end', str(props.native_cloth_end), '--memory-limit', str(props.native_cloth_memory_gb) + 'G']
-        command += ['--scope', props.native_cloth_scope]
-        if props.native_cloth_scope != 'SCENE':
-            command += ['--armature', arm.name]
+        command += ['--scope', props.physics_bake_scope]
+        command += ['--armature', arm.name]
         self._process = None
         self._timer = None
         self._workspace = context.workspace
@@ -3291,303 +3111,47 @@ class BONECHAIN_OT_native_cloth_bake_isolated(Operator):
         if self._workspace:
             self._workspace.status_text_set(None)
         _BONECHAIN_BAKE_OWNER = None
+        reason = ''
+        if code != 0:
+            try:
+                import os
+                with open(self._log_path, 'rb') as log:
+                    log.seek(0, os.SEEK_END)
+                    log.seek(max(0, log.tell() - 8192))
+                    lines = log.read(8192).decode('utf-8', errors='replace').splitlines()
+                reason = next((line for line in reversed(lines)
+                               if line.startswith(('RuntimeError:', 'MemoryError:', 'ModuleNotFoundError:'))), '')
+                if not reason and any('oom-kill' in line.lower() for line in lines):
+                    reason = '工作进程达到内存上限'
+            except OSError:
+                pass
         self.report({'INFO'} if code == 0 else {'WARNING'},
-                    ('隔离烘焙完成，结果在新工程副本；' if code == 0 else '隔离烘焙已停止，原工程保留；')
+                    ('隔离烘焙完成，结果在新工程副本；' if code == 0 else
+                     '隔离烘焙已停止：' + (reason or f'退出码 {code}') + '；原工程保留；')
                     + '详情：' + self._log_path)
         return {'FINISHED'} if code == 0 else {'CANCELLED'}
 
 
-class BONECHAIN_OT_native_cloth_bake(_BoneChainBakeModal, Operator):
-    bl_idname = 'bonechain.native_cloth_bake'
+class BONECHAIN_OT_physics_bake(Operator):
+    bl_idname = 'bonechain.physics_bake'
     bl_label = '正常烘焙'
-    bl_description = '按烘焙对象选择执行场景布料、Ruri 或 Wiggle；没有进程内存上限，保留原动作'
+    bl_description = '仅烘焙当前骨架的 Ruri 或 Wiggle，不管理 Blender 原生布料'
 
     def execute(self, context):
         props = context.scene.bonechain_props
-        if props.native_cloth_scope == 'RURI':
+        if props.physics_bake_scope == 'RURI':
             if not bpy.ops.bonechain.ruri_bake.poll():
                 self.report({'ERROR'}, '请先绑定骨架并启用 Ruri')
                 return {'CANCELLED'}
-            return bpy.ops.bonechain.ruri_bake('EXEC_DEFAULT', frame_start=props.native_cloth_start,
+            result = bpy.ops.bonechain.ruri_bake('EXEC_DEFAULT', frame_start=props.native_cloth_start,
                 frame_end=props.native_cloth_end, preroll=props.native_cloth_preroll)
-        if props.native_cloth_scope == 'WIGGLE':
-            if not bpy.ops.bonechain.wiggle_bake.poll():
-                self.report({'ERROR'}, '请先选择骨架')
-                return {'CANCELLED'}
-            return bpy.ops.bonechain.wiggle_bake('EXEC_DEFAULT', frame_start=props.native_cloth_start,
-                frame_end=props.native_cloth_end)
-        if _BONECHAIN_BAKE_OWNER is not None or _native_modal_running(context):
-            self.report({'WARNING'}, '已有烘焙在运行，请等待完成或中止')
+            return {'FINISHED'} if 'RUNNING_MODAL' in result else result
+        if not bpy.ops.bonechain.wiggle_bake.poll():
+            self.report({'ERROR'}, '请先选择骨架')
             return {'CANCELLED'}
-        props = context.scene.bonechain_props
-        start, end = props.native_cloth_start, props.native_cloth_end
-        if end < start:
-            self.report({'ERROR'}, '结束帧不能早于起始帧')
-            return {'CANCELLED'}
-        if not bpy.data.filepath:
-            self.report({'ERROR'}, '请先保存一次工程，以确定原生缓存的存储位置')
-            return {'CANCELLED'}
-        try:
-            layers, arms = _native_cloth_plan(context)
-            if not layers:
-                raise RuntimeError('场景中没有启用的原生 Cloth／Cloth Dynamics 修改器')
-            jobs = _native_cloth_bone_jobs(context, arms, props.native_cloth_bake_bones)
-        except Exception as error:
-            self.report({'ERROR'}, str(error))
-            return {'CANCELLED'}
-        self._cancel_requested = False
-        self._stage = '准备'
-        self._completed_stages = []
-        sim_start = max(-1048574, start - props.native_cloth_preroll)
-        self._plan_text = bpy.data.texts.get('原生布料烘焙记录') or bpy.data.texts.new('原生布料烘焙记录')
-        self._plan_text.clear()
-        self._plan_text.write(f'动画区间：{start}–{end}；含预模拟的缓存区间：{sim_start}–{end}\n')
-        for kind, arm in jobs:
-            self._plan_text.write(f'先烘焙骨架：{arm.name} / {kind}\n')
-        for index, layer in enumerate(layers, 1):
-            self._plan_text.write(f'布料第 {index} 层：' + ', '.join(o.name for o in layer) + '\n')
-        job = self._pipeline(context, layers, jobs, sim_start, end)
-        return self._start_bake(context, job, start, end, None, 'native_cloth')
-
-    def _pipeline(self, context, layers, jobs, start, end):
-        scene = context.scene
-        selected = list(context.selected_objects)
-        active = context.view_layer.objects.active
-        mode = active.mode if active else 'OBJECT'
-        frame, subframe = scene.frame_current, scene.frame_subframe
-        hidden = {}
-        hidden_layers = {}
-        hidden_collections = {}
-        targets = [obj for layer in layers for obj in layer]
-        cloth_mods = [(obj, mod, mod.show_viewport) for obj in targets
-                      for mod in _native_cloth_modifiers(obj)]
-        mods_by_object = {obj.name: [m for owner, m, _visible in cloth_mods if owner == obj]
-                          for obj in targets}
-        total = len(jobs) + sum(1 + len([m for m in _native_cloth_modifiers(o) if m.type == 'CLOTH'])
-                                 for layer in layers for o in layer)
-        done = 0
-        def select(objects):
-            if context.object and context.object.mode != 'OBJECT':
-                bpy.ops.object.mode_set(mode='OBJECT')
-            for obj in list(context.selected_objects):
-                obj.select_set(False)
-            wanted = {obj.name for obj in objects}
-            def reveal(layer):
-                contained = any(name in layer.collection.objects for name in wanted)
-                for child in layer.children:
-                    if reveal(child):
-                        contained = True
-                if contained:
-                    if layer.as_pointer() not in hidden_layers:
-                        hidden_layers[layer.as_pointer()] = (layer, layer.hide_viewport)
-                    layer.hide_viewport = False
-                    collection = layer.collection
-                    if collection.name not in hidden_collections:
-                        hidden_collections[collection.name] = (collection, collection.hide_viewport, collection.hide_select)
-                    collection.hide_viewport = False
-                    collection.hide_select = False
-                return contained
-            reveal(context.view_layer.layer_collection)
-            for obj in objects:
-                if obj.name not in hidden:
-                    hidden[obj.name] = (obj.hide_get(), obj.hide_select)
-                obj.hide_set(False)
-                obj.hide_select = False
-                obj.select_set(True)
-            context.view_layer.objects.active = objects[0]
-        try:
-            # Bone sampling must not populate every downstream cloth simulation.
-            if jobs:
-                for _obj, mod, _visible in cloth_mods:
-                    mod.show_viewport = False
-            for kind, arm in jobs:
-                self._stage = f'先烘焙骨架 {arm.name} · {kind}'
-                select([arm])
-                generator = (_ruri_bake_range(context, arm, start, end, 0) if kind == 'Ruri'
-                             else _wiggle_bake_range(context, arm, start, end))
-                try:
-                    for progress in generator:
-                        yield (done + progress) / total
-                finally:
-                    generator.close()
-                self._completed_stages.append(self._stage)
-                for group in scene.bonechain_props.groups:
-                    if kind == 'Ruri' and group.collision_mode == 'RURI' and group.ruri_armature == arm:
-                        group.ruri_bake_start, group.ruri_bake_end = start, end
-                done += 1
-            for _obj, mod, visible in cloth_mods:
-                mod.show_viewport = visible
-            # All target caches are invalid after updating upstream animation.
-            self._stage = '清理布料旧缓存'
-            node_targets = [obj for obj in targets if any(m.type == 'NODES' for m in _native_cloth_modifiers(obj))]
-            if node_targets:
-                select(node_targets)
-                bpy.ops.object.simulation_nodes_cache_delete(selected=True)
-            for obj in targets:
-                for mod in _native_cloth_modifiers(obj):
-                    if mod.type == 'CLOTH':
-                        with context.temp_override(object=obj, active_object=obj, point_cache=mod.point_cache):
-                            bpy.ops.ptcache.free_bake()
-                        _native_cloth_use_disk_cache(obj, mod)
-                        mod.point_cache.frame_start = start
-                        mod.point_cache.frame_end = end
-                    else:
-                        _native_cloth_use_disk_cache(obj, mod)
-                        obj.use_simulation_cache = True
-                        for bake in mod.bakes:
-                            bake.use_custom_simulation_frame_range = True
-                            bake.frame_start, bake.frame_end = start, end
-            # Pending downstream cloth must not accumulate live frame caches while
-            # upstream cloth is being baked. Completed sources remain enabled.
-            for _obj, mod, _visible in cloth_mods:
-                mod.show_viewport = False
-            for index, layer in enumerate(layers, 1):
-                nodes = [obj for obj in layer if any(m.type == 'NODES' for m in mods_by_object[obj.name])]
-                # Traditional cloth first within an independent dependency layer.
-                for obj in layer:
-                    for mod in mods_by_object[obj.name]:
-                        if mod.type != 'CLOTH':
-                            continue
-                        mod.show_viewport = True
-                        self._stage = f'第 {index} 层 · {obj.name} · Cloth'
-                        select([obj])
-                        scene.frame_set(start)
-                        with context.temp_override(point_cache=mod.point_cache):
-                            call = 'EXEC_DEFAULT' if bpy.app.background else 'INVOKE_DEFAULT'
-                            result = bpy.ops.ptcache.bake(call, bake=True)
-                        if 'CANCELLED' in result:
-                            raise RuntimeError(f'{obj.name} 的 Cloth 烘焙未启动')
-                        yield done / total
-                        while _native_modal_running(context):
-                            yield done / total
-                        if not mod.point_cache.is_baked:
-                            raise RuntimeError(f'{obj.name} 的 Cloth 未完成烘焙')
-                        self._completed_stages.append(self._stage)
-                        done += 1
-                for obj in nodes:
-                    for mod in mods_by_object[obj.name]:
-                        if mod.type == 'NODES':
-                            mod.show_viewport = True
-                    self._stage = f'第 {index} 层 · {obj.name} · 几何节点布料（磁盘）'
-                    select([obj])
-                    scene.frame_set(start)
-                    call = 'EXEC_DEFAULT' if bpy.app.background else 'INVOKE_DEFAULT'
-                    result = bpy.ops.object.simulation_nodes_cache_bake(call, selected=True)
-                    if 'CANCELLED' in result:
-                        raise RuntimeError('几何节点布料烘焙未启动')
-                    yield done / total
-                    while _native_modal_running(context):
-                        yield done / total
-                    self._completed_stages.append(self._stage)
-                done += len(layer)
-                yield done / total
-        finally:
-            for _obj, mod, visible in cloth_mods:
-                mod.show_viewport = visible
-            scene.frame_set(frame, subframe=subframe)
-            for obj in list(context.selected_objects):
-                obj.select_set(False)
-            for obj in selected:
-                if obj.name in context.view_layer.objects:
-                    obj.select_set(True)
-            for name, (was_hidden, was_unselectable) in hidden.items():
-                obj = scene.objects.get(name)
-                if obj:
-                    obj.hide_set(was_hidden)
-                    obj.hide_select = was_unselectable
-            for layer, was_hidden in hidden_layers.values():
-                layer.hide_viewport = was_hidden
-            for collection, was_hidden, was_unselectable in hidden_collections.values():
-                collection.hide_viewport = was_hidden
-                collection.hide_select = was_unselectable
-            if active and active.name in context.view_layer.objects:
-                context.view_layer.objects.active = active
-                if mode != 'OBJECT':
-                    bpy.ops.object.mode_set(mode=mode)
-        return len(targets)
-
-    def _show_progress(self, progress):
-        self._wm.progress_update(progress * 100)
-        if self._workspace:
-            self._workspace.status_text_set(f'{self._stage} · {progress:.0%} · Esc 中止')
-
-    def modal(self, context, event):
-        if event.type == 'ESC':
-            self._cancel_requested = True
-            if not _native_modal_running(context):
-                return self._finish(context, cancelled=True)
-            return {'PASS_THROUGH'}
-        if self._cancel_requested:
-            if not _native_modal_running(context):
-                return self._finish(context, cancelled=True)
-            return {'PASS_THROUGH'}
-        return super().modal(context, event)
-
-    def _finish(self, context, result=None, error=None, cancelled=False):
-        global _BONECHAIN_BAKE_OWNER
-        if self._finished:
-            return {'CANCELLED'}
-        self._finished = True
-        try:
-            self._job.close()
-        except Exception as cleanup_error:
-            if error is None:
-                error = cleanup_error
-        finally:
-            _BONECHAIN_BAKE_OWNER = None
-            if self._timer is not None:
-                self._wm.event_timer_remove(self._timer)
-            self._wm.progress_end()
-            if self._workspace:
-                self._workspace.status_text_set(None)
-        if error or cancelled:
-            reason = str(error) if error else '用户中止'
-            self._plan_text.write(f'\n停止于：{self._stage}；{reason}\n已完成：' + '\n'.join(self._completed_stages))
-            self.report({'WARNING'}, f'烘焙停止：{reason}；已完成 {len(self._completed_stages)} 个阶段，已完成的动作/缓存保留')
-            return {'CANCELLED'}
-        self._plan_text.write('\n已完成全部阶段；请保存工程。\n')
-        self.report({'INFO'}, f'已按依赖顺序烘焙 {result} 个布料对象；请保存工程并保留旁边的磁盘缓存目录')
-        return {'FINISHED'}
-
-
-class BONECHAIN_OT_native_cloth_delete(Operator):
-    bl_idname = 'bonechain.native_cloth_delete'
-    bl_label = '删除场景布料烘焙'
-    bl_description = '删除启用布料对象的原生缓存；保留 Ruri/Wiggle 动作与已停用的 Cloth 缓存'
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        if _BONECHAIN_BAKE_OWNER is not None or _native_modal_running(context):
-            self.report({'WARNING'}, '请先等待烘焙完成或中止')
-            return {'CANCELLED'}
-        try:
-            layers, _arms = _native_cloth_plan(context)
-            # Deletion must also work when collision configuration has a cycle.
-        except RuntimeError as error:
-            if not str(error).startswith('布料依赖循环：'):
-                self.report({'ERROR'}, str(error))
-                return {'CANCELLED'}
-            layers = [[obj for obj in context.scene.objects if _native_cloth_modifiers(obj)]]
-        targets = [obj for layer in layers for obj in layer]
-        if not targets:
-            self.report({'INFO'}, '没有启用的原生布料')
-            return {'FINISHED'}
-        try:
-            nodes = [obj for obj in targets if any(m.type == 'NODES' for m in _native_cloth_modifiers(obj))]
-            if nodes:
-                with context.temp_override(object=nodes[0], active_object=nodes[0], selected_objects=nodes,
-                                           selected_editable_objects=nodes):
-                    bpy.ops.object.simulation_nodes_cache_delete(selected=True)
-            for obj in targets:
-                for mod in _native_cloth_modifiers(obj):
-                    if mod.type == 'CLOTH':
-                        with context.temp_override(object=obj, active_object=obj, point_cache=mod.point_cache):
-                            bpy.ops.ptcache.free_bake()
-        except Exception as error:
-            self.report({'ERROR'}, f'部分缓存删除失败：{error}')
-            return {'CANCELLED'}
-        self.report({'INFO'}, f'已删除 {len(targets)} 个布料对象的缓存；骨骼烘焙动作保留')
-        return {'FINISHED'}
+        result = bpy.ops.bonechain.wiggle_bake('EXEC_DEFAULT', frame_start=props.native_cloth_start,
+            frame_end=props.native_cloth_end)
+        return {'FINISHED'} if 'RUNNING_MODAL' in result else result
 
 
 # ===============================================================
@@ -3641,6 +3205,40 @@ class BONECHAIN_UL_deform(UIList):
 # 面板
 # ===============================================================
 
+def _draw_physics_bake(layout, context):
+    props = context.scene.bonechain_props
+    box = layout.box()
+    box.prop(props, 'native_cloth_open', text='插件物理烘焙', emboss=False,
+             icon='TRIA_DOWN' if props.native_cloth_open else 'TRIA_RIGHT')
+    if not props.native_cloth_open:
+        return
+    box.prop(props, 'physics_bake_scope', expand=True)
+    ruri = props.physics_bake_scope == 'RURI'
+    arm = _ruri_bake_armature(context) if ruri else context.active_object
+    box.label(text='骨架：' + (arm.name if arm and arm.type == 'ARMATURE' else '未选择'))
+    box.label(text='烘焙此骨架全部启用配置', icon='INFO')
+    row = box.row(align=True)
+    row.prop(props, 'native_cloth_start')
+    row.prop(props, 'native_cloth_end')
+    if ruri:
+        box.prop(props, 'native_cloth_preroll')
+    elif hasattr(context.scene, 'wiggle'):
+        box.prop(context.scene.wiggle, 'preroll', text='预模拟帧数')
+    box.operator('bonechain.physics_bake_range', text='使用场景区间', icon='TIME')
+    box.operator('bonechain.physics_bake', text='正常烘焙', icon='RENDER_ANIMATION')
+    box.prop(props, 'native_cloth_memory_gb')
+    box.operator('bonechain.physics_bake_isolated', text='内存受限烘焙', icon='RENDER_ANIMATION')
+    box.label(text='受限：Linux · 保存后运行 · 另存副本', icon='INFO')
+    if ruri:
+        box.operator('bonechain.ruri_reset', text='复位 Ruri', icon='FILE_REFRESH')
+        box.operator('bonechain.ruri_delete_bake', text='删除 Ruri 烘焙', icon='TRASH')
+        box.operator('bonechain.ruri_cancel_bake', text='恢复实时（保留烘焙动作）', icon='LOOP_BACK')
+    else:
+        box.operator('bonechain.wiggle_reset', text='复位 Wiggle', icon='FILE_REFRESH')
+        box.operator_context = 'INVOKE_DEFAULT'
+        box.operator('bonechain.wiggle_cancel_bake', text='取消 Wiggle 烘焙／恢复实时', icon='LOOP_BACK')
+
+
 class BONECHAIN_PT_panel(Panel):
     bl_label = "骨骼链阻尼追踪"
     bl_idname = "BONECHAIN_PT_panel"
@@ -3654,6 +3252,7 @@ class BONECHAIN_PT_panel(Panel):
         props = context.scene.bonechain_props
         if not (obj and obj.type == 'ARMATURE' and context.mode == 'POSE'):
             layout.label(text="请在姿态模式下操作", icon='INFO')
+            _draw_physics_bake(layout, context)
             return
         props = context.scene.bonechain_props
 
@@ -3679,6 +3278,7 @@ class BONECHAIN_PT_panel(Panel):
         grp = _get_active_group(context)
         if not grp:
             layout.label(text="请新建一个分组开始", icon='INFO')
+            _draw_physics_bake(layout, context)
             return
 
         # 柔性组
@@ -3767,10 +3367,6 @@ class BONECHAIN_PT_panel(Panel):
                     spring_box.prop(config, 'blend_weight')
                     spring_box.prop(config.inertia, 'world_inertia')
                     spring_box.prop(config.inertia, 'local_inertia')
-                row = box.row(align=True)
-                row.operator('bonechain.ruri_reset', text='复位 Ruri', icon='FILE_REFRESH')
-                if arm and arm.bonechain_ruri_bake_saved:
-                    box.operator('bonechain.ruri_cancel_bake', text='恢复实时（保留已有动作）', icon='LOOP_BACK')
                 box.label(text="详细参数：属性编辑器 > 物理 > Ruri", icon='INFO')
             else:
                 box.label(text="Ruri 前置未启用", icon='ERROR')
@@ -3815,11 +3411,6 @@ class BONECHAIN_PT_panel(Panel):
             wbox.label(text="阻尼追踪与旧碰撞会被停用", icon='INFO')
             wbox.operator("bonechain.apply_wiggle", text="② 应用Wiggle防穿", icon='FORCE_TURBULENCE')
 
-            wbox.operator('bonechain.wiggle_reset', text='复位 Wiggle', icon='FILE_REFRESH')
-            if context.active_object.bonechain_wiggle_bake_saved:
-                restore = wbox.row()
-                restore.operator_context = 'INVOKE_DEFAULT'
-                restore.operator('bonechain.wiggle_cancel_bake', text='恢复实时（保留已有动作）', icon='LOOP_BACK')
             wbox.label(text="配好后按播放键预览摆动+防穿", icon='INFO')
 
         else:
@@ -3850,6 +3441,8 @@ class BONECHAIN_PT_panel(Panel):
 
 
 
+        _draw_physics_bake(layout, context)
+
 # ===============================================================
 classes = (
     BoneItem, CollisionItem, ChainGroup, BoneChainProps,
@@ -3867,10 +3460,11 @@ classes = (
     BONECHAIN_OT_restore_mmd, BONECHAIN_OT_cancel_physics,
     BONECHAIN_OT_apply_ruri, BONECHAIN_OT_enable_ruri,
     BONECHAIN_OT_fill_chain_gaps,
-    # Baking is temporarily withdrawn. Keep only live preview and restoration
-    # of existing recorded actions; do not register bake/delete/cache operators.
-    BONECHAIN_OT_wiggle_reset, BONECHAIN_OT_wiggle_cancel_bake,
-    BONECHAIN_OT_ruri_reset, BONECHAIN_OT_ruri_cancel_bake,
+    BONECHAIN_OT_wiggle_reset, BONECHAIN_OT_wiggle_bake, BONECHAIN_OT_wiggle_cancel_bake,
+    BONECHAIN_OT_ruri_reset, BONECHAIN_OT_ruri_bake, BONECHAIN_OT_ruri_cancel_bake,
+    BONECHAIN_OT_ruri_delete_bake, BONECHAIN_OT_ruri_scene_range,
+    BONECHAIN_OT_physics_bake_range, BONECHAIN_OT_physics_bake,
+    BONECHAIN_OT_physics_bake_isolated,
     BONECHAIN_UL_groups, BONECHAIN_UL_flex, BONECHAIN_UL_coll,
     BONECHAIN_UL_deform,
     BONECHAIN_PT_panel,
