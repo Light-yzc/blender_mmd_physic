@@ -1,7 +1,7 @@
 bl_info = {
     "name": "骨骼链阻尼追踪",
     "author": "WANG",
-    "version": (5, 32),
+    "version": (5, 33),
     "blender": (3, 0, 0),
     "location": "View3D > 侧边栏(N) > 骨骼链",
     "description": "骨骼链物理、碰撞与细分，支持 Wiggle/Ruri 区间烘焙和恢复原动作",
@@ -475,6 +475,10 @@ class BoneChainProps(PropertyGroup):
         get=lambda self: self.get('native_cloth_end', self.id_data.frame_end),
         set=lambda self, value: self.__setitem__('native_cloth_end', value))
     native_cloth_preroll: IntProperty(name='预模拟帧数', default=30, min=0, max=10000)
+    native_cloth_isolate: BoolProperty(
+        name='独立进程烘焙（节点布料／Linux）', default=True,
+        description='逐对象启动 Blender，限制工作进程内存；读取已保存工程，结果另存新副本')
+    native_cloth_memory_gb: IntProperty(name='工作进程内存上限 (GiB)', default=8, min=2, max=1024)
     native_cloth_bake_bones: BoolProperty(
         name='先烘焙上游 Ruri／Wiggle', default=True,
         description='先按骨架烘焙布料上游的全部启用 Ruri 配置／Wiggle 骨骼，再烘焙布料；保留原动作恢复记录')
@@ -3201,12 +3205,96 @@ class BONECHAIN_OT_native_cloth_range(Operator):
         return {'FINISHED'}
 
 
+class BONECHAIN_OT_native_cloth_bake_isolated(Operator):
+    bl_idname = 'bonechain.native_cloth_bake_isolated'
+    bl_label = '独立进程烘焙场景布料'
+    bl_description = '按依赖顺序逐对象烘焙，限制工作进程内存，结果写入新工程副本；仅支持 Linux 节点布料'
+
+    def execute(self, context):
+        global _BONECHAIN_BAKE_OWNER
+        import os
+        from pathlib import Path
+        import shutil
+        import subprocess
+        import sys
+        import tempfile
+        if _BONECHAIN_BAKE_OWNER is not None or _native_modal_running(context):
+            self.report({'ERROR'}, '已有烘焙任务在运行')
+            return {'CANCELLED'}
+        if sys.platform != 'linux' or not shutil.which('systemd-run'):
+            self.report({'ERROR'}, '独立进程内存限制需要 Linux 用户 systemd')
+            return {'CANCELLED'}
+        if not bpy.data.filepath or bpy.data.is_dirty:
+            self.report({'ERROR'}, '请先保存工程；独立进程读取磁盘上的工程和设置')
+            return {'CANCELLED'}
+        root = Path(__file__).resolve().parent
+        script = next((p for p in (root / 'bonechain_tools' / 'bake_limited.py',
+                                   root / 'tools' / 'bake_limited.py') if p.is_file()), None)
+        if script is None:
+            self.report({'ERROR'}, '缺少 bonechain_tools/bake_limited.py，请同时安装隔离烘焙工具目录')
+            return {'CANCELLED'}
+        props = context.scene.bonechain_props
+        fd, self._log_path = tempfile.mkstemp(prefix='bonechain-bake-', suffix='.log')
+        command = [shutil.which('python3') or '/usr/bin/python3', str(script), bpy.data.filepath,
+                   '--blender', bpy.app.binary_path, '--start', str(props.native_cloth_start),
+                   '--end', str(props.native_cloth_end), '--memory-limit', str(props.native_cloth_memory_gb) + 'G']
+        self._process = None
+        self._timer = None
+        self._workspace = context.workspace
+        self._wm = context.window_manager
+        try:
+            with os.fdopen(fd, 'wb') as log:
+                self._process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
+                                                 start_new_session=True)
+            self._timer = self._wm.event_timer_add(0.5, window=context.window)
+            self._wm.modal_handler_add(self)
+        except Exception as error:
+            if self._process and self._process.poll() is None:
+                import signal
+                os.killpg(self._process.pid, signal.SIGINT)
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+        _BONECHAIN_BAKE_OWNER = self
+        self._cancel_sent = False
+        self.report({'INFO'}, '已启动内存受限烘焙；结果另存新副本。日志：' + self._log_path)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        global _BONECHAIN_BAKE_OWNER
+        if event.type == 'ESC' and not self._cancel_sent and self._process.poll() is None:
+            import os
+            import signal
+            try:
+                os.killpg(self._process.pid, signal.SIGINT)
+            except ProcessLookupError:
+                pass
+            self._cancel_sent = True
+        if event.type != 'TIMER':
+            return {'PASS_THROUGH'}
+        code = self._process.poll()
+        if code is None:
+            if self._workspace:
+                self._workspace.status_text_set('独立进程烘焙中（内存受限）· Esc 中止 · 日志：' + self._log_path)
+            return {'PASS_THROUGH'}
+        if self._timer:
+            self._wm.event_timer_remove(self._timer)
+        if self._workspace:
+            self._workspace.status_text_set(None)
+        _BONECHAIN_BAKE_OWNER = None
+        self.report({'INFO'} if code == 0 else {'WARNING'},
+                    ('隔离烘焙完成，结果在新工程副本；' if code == 0 else '隔离烘焙已停止，原工程保留；')
+                    + '详情：' + self._log_path)
+        return {'FINISHED'} if code == 0 else {'CANCELLED'}
+
+
 class BONECHAIN_OT_native_cloth_bake(_BoneChainBakeModal, Operator):
     bl_idname = 'bonechain.native_cloth_bake'
     bl_label = '按依赖顺序烘焙场景布料'
     bl_description = '自动找到启用的原生布料，先烘焙上游骨架，再按碰撞和代理依赖重新烘焙；保留原动作'
 
     def execute(self, context):
+        if not bpy.app.background and context.scene.bonechain_props.native_cloth_isolate:
+            return bpy.ops.bonechain.native_cloth_bake_isolated('EXEC_DEFAULT')
         if _BONECHAIN_BAKE_OWNER is not None or _native_modal_running(context):
             self.report({'WARNING'}, '已有烘焙在运行，请等待完成或中止')
             return {'CANCELLED'}
@@ -3552,6 +3640,10 @@ class BONECHAIN_PT_panel(Panel):
             row.prop(props, 'native_cloth_start')
             row.prop(props, 'native_cloth_end')
             native.prop(props, 'native_cloth_preroll')
+            native.prop(props, 'native_cloth_isolate')
+            if props.native_cloth_isolate:
+                native.prop(props, 'native_cloth_memory_gb')
+                native.label(text='先保存工程；结果另存副本', icon='INFO')
             native.prop(props, 'native_cloth_bake_bones')
             if props.native_cloth_bake_bones:
                 native.label(text='上游骨架中的启用组会一起烘焙', icon='INFO')
@@ -3802,7 +3894,8 @@ classes = (
     BONECHAIN_OT_wiggle_reset, BONECHAIN_OT_wiggle_bake, BONECHAIN_OT_wiggle_cancel_bake,
     BONECHAIN_OT_ruri_reset, BONECHAIN_OT_ruri_bake, BONECHAIN_OT_ruri_cancel_bake,
     BONECHAIN_OT_ruri_delete_bake, BONECHAIN_OT_ruri_scene_range,
-    BONECHAIN_OT_native_cloth_range, BONECHAIN_OT_native_cloth_bake,
+    BONECHAIN_OT_native_cloth_range, BONECHAIN_OT_native_cloth_bake_isolated,
+    BONECHAIN_OT_native_cloth_bake,
     BONECHAIN_OT_native_cloth_delete,
     BONECHAIN_UL_groups, BONECHAIN_UL_flex, BONECHAIN_UL_coll,
     BONECHAIN_UL_deform,
