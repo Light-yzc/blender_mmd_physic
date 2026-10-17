@@ -1,7 +1,7 @@
 bl_info = {
     "name": "骨骼链阻尼追踪",
     "author": "WANG",
-    "version": (5, 31),
+    "version": (5, 32),
     "blender": (3, 0, 0),
     "location": "View3D > 侧边栏(N) > 骨骼链",
     "description": "骨骼链物理、碰撞与细分，支持 Wiggle/Ruri 区间烘焙和恢复原动作",
@@ -3023,6 +3023,21 @@ def _native_cloth_modifiers(obj, enabled_only=True):
     return found
 
 
+def _native_cloth_use_disk_cache(obj, mod):
+    # Explicit per-bake targets are necessary: INHERIT defaults to PACKED in Blender.
+    if mod.type == 'CLOTH':
+        cache = mod.point_cache
+        cache.use_disk_cache = True
+        return
+    mod.bake_target = 'DISK'
+    project = bpy.path.clean_name(bpy.path.display_name_from_filepath(bpy.data.filepath))
+    token = hashlib.sha256((obj.name + '\0' + mod.name).encode('utf-8')).hexdigest()[:20]
+    for bake in mod.bakes:
+        bake.bake_target = 'DISK'
+        bake.use_custom_path = True
+        bake.directory = f'//{project}_physics_cache/{token}/{bake.bake_id}'
+
+
 def _cloth_object_sources(obj, scene):
     sources = {}
     def add(value):
@@ -3235,6 +3250,10 @@ class BONECHAIN_OT_native_cloth_bake(_BoneChainBakeModal, Operator):
         hidden_layers = {}
         hidden_collections = {}
         targets = [obj for layer in layers for obj in layer]
+        cloth_mods = [(obj, mod, mod.show_viewport) for obj in targets
+                      for mod in _native_cloth_modifiers(obj)]
+        mods_by_object = {obj.name: [m for owner, m, _visible in cloth_mods if owner == obj]
+                          for obj in targets}
         total = len(jobs) + sum(1 + len([m for m in _native_cloth_modifiers(o) if m.type == 'CLOTH'])
                                  for layer in layers for o in layer)
         done = 0
@@ -3268,6 +3287,10 @@ class BONECHAIN_OT_native_cloth_bake(_BoneChainBakeModal, Operator):
                 obj.select_set(True)
             context.view_layer.objects.active = objects[0]
         try:
+            # Bone sampling must not populate every downstream cloth simulation.
+            if jobs:
+                for _obj, mod, _visible in cloth_mods:
+                    mod.show_viewport = False
             for kind, arm in jobs:
                 self._stage = f'先烘焙骨架 {arm.name} · {kind}'
                 select([arm])
@@ -3283,6 +3306,8 @@ class BONECHAIN_OT_native_cloth_bake(_BoneChainBakeModal, Operator):
                     if kind == 'Ruri' and group.collision_mode == 'RURI' and group.ruri_armature == arm:
                         group.ruri_bake_start, group.ruri_bake_end = start, end
                 done += 1
+            for _obj, mod, visible in cloth_mods:
+                mod.show_viewport = visible
             # All target caches are invalid after updating upstream animation.
             self._stage = '清理布料旧缓存'
             node_targets = [obj for obj in targets if any(m.type == 'NODES' for m in _native_cloth_modifiers(obj))]
@@ -3294,20 +3319,27 @@ class BONECHAIN_OT_native_cloth_bake(_BoneChainBakeModal, Operator):
                     if mod.type == 'CLOTH':
                         with context.temp_override(object=obj, active_object=obj, point_cache=mod.point_cache):
                             bpy.ops.ptcache.free_bake()
+                        _native_cloth_use_disk_cache(obj, mod)
                         mod.point_cache.frame_start = start
                         mod.point_cache.frame_end = end
                     else:
+                        _native_cloth_use_disk_cache(obj, mod)
                         obj.use_simulation_cache = True
                         for bake in mod.bakes:
                             bake.use_custom_simulation_frame_range = True
                             bake.frame_start, bake.frame_end = start, end
+            # Pending downstream cloth must not accumulate live frame caches while
+            # upstream cloth is being baked. Completed sources remain enabled.
+            for _obj, mod, _visible in cloth_mods:
+                mod.show_viewport = False
             for index, layer in enumerate(layers, 1):
-                nodes = [obj for obj in layer if any(m.type == 'NODES' for m in _native_cloth_modifiers(obj))]
+                nodes = [obj for obj in layer if any(m.type == 'NODES' for m in mods_by_object[obj.name])]
                 # Traditional cloth first within an independent dependency layer.
                 for obj in layer:
-                    for mod in _native_cloth_modifiers(obj):
+                    for mod in mods_by_object[obj.name]:
                         if mod.type != 'CLOTH':
                             continue
+                        mod.show_viewport = True
                         self._stage = f'第 {index} 层 · {obj.name} · Cloth'
                         select([obj])
                         scene.frame_set(start)
@@ -3323,9 +3355,12 @@ class BONECHAIN_OT_native_cloth_bake(_BoneChainBakeModal, Operator):
                             raise RuntimeError(f'{obj.name} 的 Cloth 未完成烘焙')
                         self._completed_stages.append(self._stage)
                         done += 1
-                if nodes:
-                    self._stage = f'第 {index} 层 · 几何节点布料 {len(nodes)} 个对象'
-                    select(nodes)
+                for obj in nodes:
+                    for mod in mods_by_object[obj.name]:
+                        if mod.type == 'NODES':
+                            mod.show_viewport = True
+                    self._stage = f'第 {index} 层 · {obj.name} · 几何节点布料（磁盘）'
+                    select([obj])
                     scene.frame_set(start)
                     call = 'EXEC_DEFAULT' if bpy.app.background else 'INVOKE_DEFAULT'
                     result = bpy.ops.object.simulation_nodes_cache_bake(call, selected=True)
@@ -3338,6 +3373,8 @@ class BONECHAIN_OT_native_cloth_bake(_BoneChainBakeModal, Operator):
                 done += len(layer)
                 yield done / total
         finally:
+            for _obj, mod, visible in cloth_mods:
+                mod.show_viewport = visible
             scene.frame_set(frame, subframe=subframe)
             for obj in list(context.selected_objects):
                 obj.select_set(False)
@@ -3400,7 +3437,7 @@ class BONECHAIN_OT_native_cloth_bake(_BoneChainBakeModal, Operator):
             self.report({'WARNING'}, f'烘焙停止：{reason}；已完成 {len(self._completed_stages)} 个阶段，已完成的动作/缓存保留')
             return {'CANCELLED'}
         self._plan_text.write('\n已完成全部阶段；请保存工程。\n')
-        self.report({'INFO'}, f'已按依赖顺序烘焙 {result} 个布料对象；请保存工程以保留打包缓存')
+        self.report({'INFO'}, f'已按依赖顺序烘焙 {result} 个布料对象；请保存工程并保留旁边的磁盘缓存目录')
         return {'FINISHED'}
 
 
@@ -3520,6 +3557,7 @@ class BONECHAIN_PT_panel(Panel):
                 native.label(text='上游骨架中的启用组会一起烘焙', icon='INFO')
             native.operator('bonechain.native_cloth_range', icon='TIME')
             native.label(text='骨骼物理 → 上游布料 → 下游布料', icon='SORTTIME')
+            native.label(text='磁盘缓存 · 逐对象烘焙', icon='DISK_DRIVE')
             native.operator('bonechain.native_cloth_bake', icon='RENDER_ANIMATION')
             native.operator('bonechain.native_cloth_delete', icon='TRASH')
         if not (obj and obj.type == 'ARMATURE' and context.mode == 'POSE'):

@@ -16,3 +16,5 @@ build/
 *.log
 .env
 .env.*
+
+*_physics_cache/
