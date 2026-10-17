@@ -18,5 +18,6 @@
 - 本地扩展清单：2.4.0，作者 shteeve3d、Chamiseul。
 - 本地扩展声明：GPL-3.0-or-later；安装包许可原文保存在 `LICENSES/Wiggle2-GPL-3.0.txt`。
 - 补丁：`patches/wiggle-rtx-pose-write.patch`，调整姿态写回、碰撞约束后的更新与批量重置。
+- 补丁：`patches/wiggle-layer-context.patch`，修复原生烘焙上下文缺少 `object` 时的图层逐帧回调报错。
 
-两份补丁只针对本地适配时的对应文件，不代表适用于第三方项目的任意版本。仓库不包含这两个插件的完整源代码或安装包。
+上述补丁只针对本地适配时的对应文件，不代表适用于第三方项目的任意版本。仓库不包含这两个插件的完整源代码或安装包。

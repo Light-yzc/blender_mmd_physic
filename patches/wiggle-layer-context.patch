@@ -1,0 +1,14 @@
+--- a/wiggle_layers.py
++++ b/wiggle_layers.py
+@@ -684,7 +684,10 @@
+     # skipped entirely while a bake is in progress.
+     if _baking_in_progress:
+         return
+-    obj = bpy.context.object
++    # Native bake/render callbacks may have no UI object in their context.
++    # Layer UI synchronization needs that object; the simulation has its own
++    # frame handlers and must not be disabled here.
++    obj = getattr(bpy.context, "object", None)
+     if obj and obj.type == 'ARMATURE' and hasattr(obj, "wiggle_layers") and obj.wiggle_layers:
+         with NoAutoKey(scene):
+             sync_layers(obj)
