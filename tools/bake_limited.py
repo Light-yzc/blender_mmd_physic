@@ -236,6 +236,7 @@ def main():
 
 
 if __name__ == '__main__':
+    raise SystemExit('5.36 已暂时撤下所有插件烘焙功能，此工具当前不执行任务。')
     if '--' in sys.argv and '--worker' in sys.argv[sys.argv.index('--') + 1:]:
         params = sys.argv[sys.argv.index('--') + 1:]
         worker(params[1], params[2])

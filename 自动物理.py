@@ -1,10 +1,10 @@
 bl_info = {
     "name": "骨骼链阻尼追踪",
     "author": "WANG",
-    "version": (5, 35),
+    "version": (5, 36),
     "blender": (3, 0, 0),
     "location": "View3D > 侧边栏(N) > 骨骼链",
-    "description": "骨骼链物理、碰撞与细分，支持 Wiggle/Ruri 区间烘焙和恢复原动作",
+    "description": "骨骼链物理、碰撞与细分，配置 Wiggle/Ruri 实时模拟",
     "category": "Rigging",
 }
 
@@ -3641,51 +3641,6 @@ class BONECHAIN_UL_deform(UIList):
 # 面板
 # ===============================================================
 
-def _draw_bake_controls(layout, context):
-    props = context.scene.bonechain_props
-    box = layout.box()
-    box.prop(props, 'native_cloth_open', emboss=False,
-             icon='TRIA_DOWN' if props.native_cloth_open else 'TRIA_RIGHT')
-    if not props.native_cloth_open:
-        return
-    box.prop(props, 'native_cloth_scope')
-    scope = props.native_cloth_scope
-    if scope == 'SCENE':
-        count = sum(bool(_native_cloth_modifiers(obj)) for obj in context.scene.objects)
-        box.label(text=f'{count} 个启用的布料对象（含代理）')
-    else:
-        arm = _ruri_bake_armature(context) if scope == 'RURI' else context.active_object
-        box.label(text='骨架：' + (arm.name if arm and arm.type == 'ARMATURE' else '未选择'))
-        box.label(text='处理此骨架全部启用配置', icon='INFO')
-    row = box.row(align=True)
-    row.prop(props, 'native_cloth_start')
-    row.prop(props, 'native_cloth_end')
-    if scope == 'WIGGLE':
-        if hasattr(context.scene, 'wiggle'):
-            box.prop(context.scene.wiggle, 'preroll', text='预模拟帧数')
-    else:
-        box.prop(props, 'native_cloth_preroll')
-    box.operator('bonechain.native_cloth_range', text='使用场景区间', icon='TIME')
-    if scope == 'SCENE':
-        box.prop(props, 'native_cloth_bake_bones')
-        box.label(text='骨骼物理 → 上游布料 → 下游布料', icon='SORTTIME')
-    box.operator('bonechain.native_cloth_bake', text='正常烘焙', icon='RENDER_ANIMATION')
-    box.prop(props, 'native_cloth_memory_gb')
-    box.operator('bonechain.native_cloth_bake_isolated', text='内存受限烘焙', icon='RENDER_ANIMATION')
-    box.label(text='受限模式：Linux · 先保存 · 结果另存副本', icon='INFO')
-    if scope == 'SCENE':
-        box.operator('bonechain.native_cloth_delete', text='删除场景布料烘焙', icon='TRASH')
-    elif scope == 'RURI':
-        box.operator('bonechain.ruri_reset', text='复位 Ruri', icon='FILE_REFRESH')
-        box.operator('bonechain.ruri_delete_bake', text='删除 Ruri 烘焙', icon='TRASH')
-        box.operator('bonechain.ruri_cancel_bake', text='恢复实时（保留烘焙动作）', icon='LOOP_BACK')
-        if _ruri_bake_active(_ruri_bake_armature(context)):
-            box.label(text='已烘焙：当前使用关键帧', icon='CHECKMARK')
-    else:
-        box.operator('bonechain.wiggle_reset', text='复位 Wiggle', icon='FILE_REFRESH')
-        box.operator_context = 'INVOKE_DEFAULT'
-        box.operator('bonechain.wiggle_cancel_bake', text='取消 Wiggle 烘焙／恢复实时', icon='LOOP_BACK')
-
 class BONECHAIN_PT_panel(Panel):
     bl_label = "骨骼链阻尼追踪"
     bl_idname = "BONECHAIN_PT_panel"
@@ -3699,7 +3654,6 @@ class BONECHAIN_PT_panel(Panel):
         props = context.scene.bonechain_props
         if not (obj and obj.type == 'ARMATURE' and context.mode == 'POSE'):
             layout.label(text="请在姿态模式下操作", icon='INFO')
-            _draw_bake_controls(layout, context)
             return
         props = context.scene.bonechain_props
 
@@ -3725,7 +3679,6 @@ class BONECHAIN_PT_panel(Panel):
         grp = _get_active_group(context)
         if not grp:
             layout.label(text="请新建一个分组开始", icon='INFO')
-            _draw_bake_controls(layout, context)
             return
 
         # 柔性组
@@ -3814,6 +3767,10 @@ class BONECHAIN_PT_panel(Panel):
                     spring_box.prop(config, 'blend_weight')
                     spring_box.prop(config.inertia, 'world_inertia')
                     spring_box.prop(config.inertia, 'local_inertia')
+                row = box.row(align=True)
+                row.operator('bonechain.ruri_reset', text='复位 Ruri', icon='FILE_REFRESH')
+                if arm and arm.bonechain_ruri_bake_saved:
+                    box.operator('bonechain.ruri_cancel_bake', text='恢复实时（保留已有动作）', icon='LOOP_BACK')
                 box.label(text="详细参数：属性编辑器 > 物理 > Ruri", icon='INFO')
             else:
                 box.label(text="Ruri 前置未启用", icon='ERROR')
@@ -3858,6 +3815,11 @@ class BONECHAIN_PT_panel(Panel):
             wbox.label(text="阻尼追踪与旧碰撞会被停用", icon='INFO')
             wbox.operator("bonechain.apply_wiggle", text="② 应用Wiggle防穿", icon='FORCE_TURBULENCE')
 
+            wbox.operator('bonechain.wiggle_reset', text='复位 Wiggle', icon='FILE_REFRESH')
+            if context.active_object.bonechain_wiggle_bake_saved:
+                restore = wbox.row()
+                restore.operator_context = 'INVOKE_DEFAULT'
+                restore.operator('bonechain.wiggle_cancel_bake', text='恢复实时（保留已有动作）', icon='LOOP_BACK')
             wbox.label(text="配好后按播放键预览摆动+防穿", icon='INFO')
 
         else:
@@ -3887,7 +3849,6 @@ class BONECHAIN_PT_panel(Panel):
             lbox.operator("bonechain.apply_collision", text="② 应用老版防穿", icon='CON_DISTLIMIT')
 
 
-        _draw_bake_controls(layout, context)
 
 # ===============================================================
 classes = (
@@ -3906,12 +3867,10 @@ classes = (
     BONECHAIN_OT_restore_mmd, BONECHAIN_OT_cancel_physics,
     BONECHAIN_OT_apply_ruri, BONECHAIN_OT_enable_ruri,
     BONECHAIN_OT_fill_chain_gaps,
-    BONECHAIN_OT_wiggle_reset, BONECHAIN_OT_wiggle_bake, BONECHAIN_OT_wiggle_cancel_bake,
-    BONECHAIN_OT_ruri_reset, BONECHAIN_OT_ruri_bake, BONECHAIN_OT_ruri_cancel_bake,
-    BONECHAIN_OT_ruri_delete_bake, BONECHAIN_OT_ruri_scene_range,
-    BONECHAIN_OT_native_cloth_range, BONECHAIN_OT_native_cloth_bake_isolated,
-    BONECHAIN_OT_native_cloth_bake,
-    BONECHAIN_OT_native_cloth_delete,
+    # Baking is temporarily withdrawn. Keep only live preview and restoration
+    # of existing recorded actions; do not register bake/delete/cache operators.
+    BONECHAIN_OT_wiggle_reset, BONECHAIN_OT_wiggle_cancel_bake,
+    BONECHAIN_OT_ruri_reset, BONECHAIN_OT_ruri_cancel_bake,
     BONECHAIN_UL_groups, BONECHAIN_UL_flex, BONECHAIN_UL_coll,
     BONECHAIN_UL_deform,
     BONECHAIN_PT_panel,
