@@ -61,27 +61,38 @@ def worker(job_path, stage):
     if scene != bpy.context.scene:
         raise RuntimeError('无法激活计划中的场景')
     if stage == 'plan':
-        layers, arms = module._native_cloth_plan(bpy.context)
-        if not layers:
-            raise RuntimeError('没有启用的原生布料')
-        targets = [obj for layer in layers for obj in layer]
-        if any(mod.type != 'NODES' for obj in targets
-               for mod in module._native_cloth_modifiers(obj)):
-            raise RuntimeError('此隔离工具目前仅支持节点布料；场景包含传统 Cloth，请勿混用。')
         props = scene.bonechain_props
-        jobs = module._native_cloth_bone_jobs(bpy.context, arms, props.native_cloth_bake_bones)
+        scope = job.get('scope', 'SCENE')
+        if scope == 'SCENE':
+            layers, arms = module._native_cloth_plan(bpy.context)
+            if not layers:
+                raise RuntimeError('没有启用的原生布料')
+            targets = [obj for layer in layers for obj in layer]
+            if any(mod.type != 'NODES' for obj in targets
+                   for mod in module._native_cloth_modifiers(obj)):
+                raise RuntimeError('隔离场景烘焙目前仅支持节点布料，场景包含传统 Cloth。')
+            jobs = module._native_cloth_bone_jobs(bpy.context, arms, props.native_cloth_bake_bones)
+        else:
+            arm = bpy.data.objects.get(job.get('armature', ''))
+            if not arm or arm.type != 'ARMATURE' or arm.name not in scene.objects:
+                raise RuntimeError('找不到指定骨架')
+            # Bone-only bake never requires cloth, nor evaluates its caches.
+            targets = [obj for obj in scene.objects if module._native_cloth_modifiers(obj)]
+            jobs = [('Ruri' if scope == 'RURI' else 'Wiggle', arm)]
         start = job.get('start')
         end = job.get('end')
         start = props.native_cloth_start if start is None else start
         end = props.native_cloth_end if end is None else end
         if end < start:
             raise RuntimeError('结束帧早于起始帧')
-        job.update(scene=scene.name, start=start - props.native_cloth_preroll, end=end,
+        job.update(scene=scene.name,
+                   start=max(-1048574, start - props.native_cloth_preroll) if scope == 'SCENE' else start,
+                   preroll=props.native_cloth_preroll, end=end,
                    modifiers=[{'object':obj.name, 'modifier':mod.name,
                                'visible':mod.show_viewport}
                               for obj in targets for mod in module._native_cloth_modifiers(obj)],
                    stages=([{'kind':kind, 'object':arm.name} for kind, arm in jobs]
-                           + [{'kind':'cloth', 'object':obj.name} for obj in targets]))
+                           + ([{'kind':'cloth', 'object':obj.name} for obj in targets] if scope == 'SCENE' else [])))
         path.write_text(json.dumps(job, ensure_ascii=False, indent=2))
     else:
         task = job['stages'][int(stage)]
@@ -100,14 +111,25 @@ def worker(job_path, stage):
                 bpy.ops.object.mode_set(mode='OBJECT')
             bpy.context.view_layer.objects.active = obj
             if task['kind'] in {'Ruri', 'Wiggle'}:
-                generator = (module._ruri_bake_range(bpy.context, obj, job['start'], job['end'], 0)
-                             if task['kind'] == 'Ruri' else
-                             module._wiggle_bake_range(bpy.context, obj, job['start'], job['end']))
-                try:
-                    for progress in generator:
-                        print('BONE_PROGRESS', round(progress * 100, 1), flush=True)
-                finally:
-                    generator.close()
+                if job.get('scope', 'SCENE') != 'SCENE':
+                    with bpy.context.temp_override(object=obj, active_object=obj):
+                        if task['kind'] == 'Ruri':
+                            result = bpy.ops.bonechain.ruri_bake('EXEC_DEFAULT',
+                                frame_start=job['start'], frame_end=job['end'], preroll=job['preroll'])
+                        else:
+                            result = bpy.ops.bonechain.wiggle_bake('EXEC_DEFAULT',
+                                frame_start=job['start'], frame_end=job['end'])
+                    if 'FINISHED' not in result:
+                        raise RuntimeError('骨架烘焙未完成')
+                else:
+                    generator = (module._ruri_bake_range(bpy.context, obj, job['start'], job['end'], 0)
+                                 if task['kind'] == 'Ruri' else
+                                 module._wiggle_bake_range(bpy.context, obj, job['start'], job['end']))
+                    try:
+                        for progress in generator:
+                            print('BONE_PROGRESS', round(progress * 100, 1), flush=True)
+                    finally:
+                        generator.close()
             else:
                 obj.use_simulation_cache = True
                 for record in records:
@@ -157,6 +179,8 @@ def main():
     parser.add_argument('--start', type=int)
     parser.add_argument('--end', type=int)
     parser.add_argument('--memory-limit', default='8G')
+    parser.add_argument('--scope', choices=['SCENE', 'RURI', 'WIGGLE'], default='SCENE')
+    parser.add_argument('--armature', default='')
     args = parser.parse_args()
     source = args.project.resolve()
     blender = shutil.which(args.blender)
@@ -169,7 +193,7 @@ def main():
     output = source.with_name(stem + '.blend')
     job_path = source.with_name(stem + '.json')
     job = {'source':str(source), 'output':str(output), 'start':args.start,
-           'end':args.end, 'cache_root':'//' + stem + '_physics_cache'}
+           'end':args.end, 'scope':args.scope, 'armature':args.armature, 'cache_root':'//' + stem + '_physics_cache'}
     job_path.write_text(json.dumps(job, ensure_ascii=False, indent=2))
     script = str(Path(__file__).resolve())
     match = re.fullmatch(r'(\d+)([KMGT]?)(?:i?B)?', args.memory_limit, re.IGNORECASE)

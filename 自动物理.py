@@ -1,7 +1,7 @@
 bl_info = {
     "name": "骨骼链阻尼追踪",
     "author": "WANG",
-    "version": (5, 34),
+    "version": (5, 35),
     "blender": (3, 0, 0),
     "location": "View3D > 侧边栏(N) > 骨骼链",
     "description": "骨骼链物理、碰撞与细分，支持 Wiggle/Ruri 区间烘焙和恢复原动作",
@@ -464,8 +464,13 @@ class BoneChainProps(PropertyGroup):
     groups: CollectionProperty(type=ChainGroup)
     group_index: IntProperty(default=0)
     native_cloth_open: BoolProperty(
-        name='场景原生布料烘焙', default=False, options={'SKIP_SAVE'},
-        description='展开或折叠场景原生布料烘焙设置')
+        name='烘焙', default=False, options={'SKIP_SAVE'},
+        description='展开或折叠统一烘焙设置')
+    native_cloth_scope: EnumProperty(
+        name='烘焙对象', default='SCENE',
+        items=[('SCENE', '场景布料（含上游骨架）', '按依赖顺序处理场景布料和上游骨架'),
+               ('RURI', 'Ruri（当前骨架）', '仅烘焙当前绑定骨架的全部启用 Ruri 分组'),
+               ('WIGGLE', 'Wiggle（当前骨架）', '仅烘焙当前骨架启用的 Wiggle 骨骼')])
     native_cloth_start: IntProperty(
         name='起始帧', min=-1048574, max=1048574,
         get=lambda self: self.get('native_cloth_start', self.id_data.frame_start),
@@ -3205,7 +3210,7 @@ class BONECHAIN_OT_native_cloth_range(Operator):
 class BONECHAIN_OT_native_cloth_bake_isolated(Operator):
     bl_idname = 'bonechain.native_cloth_bake_isolated'
     bl_label = '内存受限烘焙'
-    bl_description = '按依赖顺序逐对象烘焙，限制工作进程内存，结果写入新工程副本；仅支持 Linux 节点布料'
+    bl_description = '按依赖顺序逐对象烘焙，限制工作进程内存，结果写入新工程副本；支持 Linux Ruri／Wiggle 和节点布料'
 
     def execute(self, context):
         global _BONECHAIN_BAKE_OWNER
@@ -3231,10 +3236,18 @@ class BONECHAIN_OT_native_cloth_bake_isolated(Operator):
             self.report({'ERROR'}, '缺少 bonechain_tools/bake_limited.py，请同时安装隔离烘焙工具目录')
             return {'CANCELLED'}
         props = context.scene.bonechain_props
+        arm = (_ruri_bake_armature(context) if props.native_cloth_scope == 'RURI'
+               else context.active_object)
+        if props.native_cloth_scope != 'SCENE' and (arm is None or arm.type != 'ARMATURE'):
+            self.report({'ERROR'}, '请先选择要烘焙的骨架')
+            return {'CANCELLED'}
         fd, self._log_path = tempfile.mkstemp(prefix='bonechain-bake-', suffix='.log')
         command = [shutil.which('python3') or '/usr/bin/python3', str(script), bpy.data.filepath,
                    '--blender', bpy.app.binary_path, '--start', str(props.native_cloth_start),
                    '--end', str(props.native_cloth_end), '--memory-limit', str(props.native_cloth_memory_gb) + 'G']
+        command += ['--scope', props.native_cloth_scope]
+        if props.native_cloth_scope != 'SCENE':
+            command += ['--armature', arm.name]
         self._process = None
         self._timer = None
         self._workspace = context.workspace
@@ -3287,9 +3300,22 @@ class BONECHAIN_OT_native_cloth_bake_isolated(Operator):
 class BONECHAIN_OT_native_cloth_bake(_BoneChainBakeModal, Operator):
     bl_idname = 'bonechain.native_cloth_bake'
     bl_label = '正常烘焙'
-    bl_description = '在当前 Blender 中按依赖顺序烘焙骨架和原生布料；没有进程内存上限，保留原动作'
+    bl_description = '按烘焙对象选择执行场景布料、Ruri 或 Wiggle；没有进程内存上限，保留原动作'
 
     def execute(self, context):
+        props = context.scene.bonechain_props
+        if props.native_cloth_scope == 'RURI':
+            if not bpy.ops.bonechain.ruri_bake.poll():
+                self.report({'ERROR'}, '请先绑定骨架并启用 Ruri')
+                return {'CANCELLED'}
+            return bpy.ops.bonechain.ruri_bake('EXEC_DEFAULT', frame_start=props.native_cloth_start,
+                frame_end=props.native_cloth_end, preroll=props.native_cloth_preroll)
+        if props.native_cloth_scope == 'WIGGLE':
+            if not bpy.ops.bonechain.wiggle_bake.poll():
+                self.report({'ERROR'}, '请先选择骨架')
+                return {'CANCELLED'}
+            return bpy.ops.bonechain.wiggle_bake('EXEC_DEFAULT', frame_start=props.native_cloth_start,
+                frame_end=props.native_cloth_end)
         if _BONECHAIN_BAKE_OWNER is not None or _native_modal_running(context):
             self.report({'WARNING'}, '已有烘焙在运行，请等待完成或中止')
             return {'CANCELLED'}
@@ -3614,6 +3640,52 @@ class BONECHAIN_UL_deform(UIList):
 # ===============================================================
 # 面板
 # ===============================================================
+
+def _draw_bake_controls(layout, context):
+    props = context.scene.bonechain_props
+    box = layout.box()
+    box.prop(props, 'native_cloth_open', emboss=False,
+             icon='TRIA_DOWN' if props.native_cloth_open else 'TRIA_RIGHT')
+    if not props.native_cloth_open:
+        return
+    box.prop(props, 'native_cloth_scope')
+    scope = props.native_cloth_scope
+    if scope == 'SCENE':
+        count = sum(bool(_native_cloth_modifiers(obj)) for obj in context.scene.objects)
+        box.label(text=f'{count} 个启用的布料对象（含代理）')
+    else:
+        arm = _ruri_bake_armature(context) if scope == 'RURI' else context.active_object
+        box.label(text='骨架：' + (arm.name if arm and arm.type == 'ARMATURE' else '未选择'))
+        box.label(text='处理此骨架全部启用配置', icon='INFO')
+    row = box.row(align=True)
+    row.prop(props, 'native_cloth_start')
+    row.prop(props, 'native_cloth_end')
+    if scope == 'WIGGLE':
+        if hasattr(context.scene, 'wiggle'):
+            box.prop(context.scene.wiggle, 'preroll', text='预模拟帧数')
+    else:
+        box.prop(props, 'native_cloth_preroll')
+    box.operator('bonechain.native_cloth_range', text='使用场景区间', icon='TIME')
+    if scope == 'SCENE':
+        box.prop(props, 'native_cloth_bake_bones')
+        box.label(text='骨骼物理 → 上游布料 → 下游布料', icon='SORTTIME')
+    box.operator('bonechain.native_cloth_bake', text='正常烘焙', icon='RENDER_ANIMATION')
+    box.prop(props, 'native_cloth_memory_gb')
+    box.operator('bonechain.native_cloth_bake_isolated', text='内存受限烘焙', icon='RENDER_ANIMATION')
+    box.label(text='受限模式：Linux · 先保存 · 结果另存副本', icon='INFO')
+    if scope == 'SCENE':
+        box.operator('bonechain.native_cloth_delete', text='删除场景布料烘焙', icon='TRASH')
+    elif scope == 'RURI':
+        box.operator('bonechain.ruri_reset', text='复位 Ruri', icon='FILE_REFRESH')
+        box.operator('bonechain.ruri_delete_bake', text='删除 Ruri 烘焙', icon='TRASH')
+        box.operator('bonechain.ruri_cancel_bake', text='恢复实时（保留烘焙动作）', icon='LOOP_BACK')
+        if _ruri_bake_active(_ruri_bake_armature(context)):
+            box.label(text='已烘焙：当前使用关键帧', icon='CHECKMARK')
+    else:
+        box.operator('bonechain.wiggle_reset', text='复位 Wiggle', icon='FILE_REFRESH')
+        box.operator_context = 'INVOKE_DEFAULT'
+        box.operator('bonechain.wiggle_cancel_bake', text='取消 Wiggle 烘焙／恢复实时', icon='LOOP_BACK')
+
 class BONECHAIN_PT_panel(Panel):
     bl_label = "骨骼链阻尼追踪"
     bl_idname = "BONECHAIN_PT_panel"
@@ -3625,31 +3697,9 @@ class BONECHAIN_PT_panel(Panel):
         layout = self.layout
         obj = context.active_object
         props = context.scene.bonechain_props
-        native = layout.box()
-        native.prop(props, 'native_cloth_open', emboss=False,
-                    icon='TRIA_DOWN' if props.native_cloth_open else 'TRIA_RIGHT')
-        if props.native_cloth_open:
-            cloth_objects = [o for o in context.scene.objects if _native_cloth_modifiers(o)]
-            native.label(text=f'自动识别 {len(cloth_objects)} 个启用的布料对象（含代理）')
-            row = native.row(align=True)
-            row.prop(props, 'native_cloth_start')
-            row.prop(props, 'native_cloth_end')
-            native.prop(props, 'native_cloth_preroll')
-            native.prop(props, 'native_cloth_bake_bones')
-            if props.native_cloth_bake_bones:
-                native.label(text='上游骨架中的启用组会一起烘焙', icon='INFO')
-            native.operator('bonechain.native_cloth_range', icon='TIME')
-            native.label(text='骨骼物理 → 上游布料 → 下游布料', icon='SORTTIME')
-            native.label(text='磁盘缓存 · 逐对象烘焙', icon='DISK_DRIVE')
-            native.operator('bonechain.native_cloth_bake', text='正常烘焙', icon='RENDER_ANIMATION')
-            limited = native.box()
-            limited.prop(props, 'native_cloth_memory_gb')
-            limited.label(text='节点布料／Linux · 先保存工程', icon='INFO')
-            limited.operator('bonechain.native_cloth_bake_isolated', text='内存受限烘焙', icon='RENDER_ANIMATION')
-            limited.label(text='独立进程；结果另存副本')
-            native.operator('bonechain.native_cloth_delete', icon='TRASH')
         if not (obj and obj.type == 'ARMATURE' and context.mode == 'POSE'):
             layout.label(text="请在姿态模式下操作", icon='INFO')
+            _draw_bake_controls(layout, context)
             return
         props = context.scene.bonechain_props
 
@@ -3675,6 +3725,7 @@ class BONECHAIN_PT_panel(Panel):
         grp = _get_active_group(context)
         if not grp:
             layout.label(text="请新建一个分组开始", icon='INFO')
+            _draw_bake_controls(layout, context)
             return
 
         # 柔性组
@@ -3763,35 +3814,6 @@ class BONECHAIN_PT_panel(Panel):
                     spring_box.prop(config, 'blend_weight')
                     spring_box.prop(config.inertia, 'world_inertia')
                     spring_box.prop(config.inertia, 'local_inertia')
-                baked = _ruri_bake_active(arm)
-                bake_box = box.box()
-                bake_box.label(text='Ruri 烘焙', icon='ACTION')
-                row = bake_box.row(align=True)
-                row.prop(grp, 'ruri_bake_start')
-                row.prop(grp, 'ruri_bake_end')
-                bake_box.prop(grp, 'ruri_bake_preroll')
-                bake_box.operator('bonechain.ruri_scene_range', text='使用场景区间', icon='TIME')
-                row = bake_box.row(align=True)
-                reset = row.row(align=True)
-                reset.enabled = not baked
-                reset.operator('bonechain.ruri_reset', text='复位', icon='FILE_REFRESH')
-                row.operator_context = 'INVOKE_DEFAULT'
-                bake = row.operator('bonechain.ruri_bake',
-                                    text='重新烘焙区间' if baked else '区间烘焙',
-                                    icon='RENDER_ANIMATION')
-                bake.frame_start = grp.ruri_bake_start
-                bake.frame_end = grp.ruri_bake_end
-                bake.preroll = grp.ruri_bake_preroll
-                bake_box.operator('bonechain.ruri_delete_bake', text='Delete Bake / 删除烘焙', icon='TRASH')
-                bake_box.operator('bonechain.ruri_cancel_bake', text='恢复实时（保留烘焙动作）', icon='LOOP_BACK')
-                if grp.ruri_bake_end < grp.ruri_bake_start:
-                    bake_box.label(text='结束帧不能早于起始帧', icon='ERROR')
-                if baked:
-                    bake_box.label(text='已烘焙：播放使用关键帧，实时模拟已关闭', icon='CHECKMARK')
-                    bake_box.label(text='修改 Ruri 参数后点击“重新烘焙区间”')
-                else:
-                    bake_box.label(text='完成后关闭此骨架实时模拟', icon='INFO')
-                bake_box.label(text='烘焙全部启用的 Ruri 分组；Esc 中止')
                 box.label(text="详细参数：属性编辑器 > 物理 > Ruri", icon='INFO')
             else:
                 box.label(text="Ruri 前置未启用", icon='ERROR')
@@ -3836,11 +3858,6 @@ class BONECHAIN_PT_panel(Panel):
             wbox.label(text="阻尼追踪与旧碰撞会被停用", icon='INFO')
             wbox.operator("bonechain.apply_wiggle", text="② 应用Wiggle防穿", icon='FORCE_TURBULENCE')
 
-            row = wbox.row(align=True)
-            row.operator("bonechain.wiggle_reset", text="重置", icon='FILE_REFRESH')
-            row.operator_context = 'INVOKE_DEFAULT'
-            row.operator("bonechain.wiggle_bake", text="区间烘焙", icon='RENDER_ANIMATION')
-            wbox.operator("bonechain.wiggle_cancel_bake", text="取消烘焙", icon='X')
             wbox.label(text="配好后按播放键预览摆动+防穿", icon='INFO')
 
         else:
@@ -3869,6 +3886,8 @@ class BONECHAIN_PT_panel(Panel):
             lbox.label(text="缩放骨架后请重新应用碰撞", icon='INFO')
             lbox.operator("bonechain.apply_collision", text="② 应用老版防穿", icon='CON_DISTLIMIT')
 
+
+        _draw_bake_controls(layout, context)
 
 # ===============================================================
 classes = (
