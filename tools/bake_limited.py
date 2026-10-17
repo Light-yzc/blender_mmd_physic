@@ -14,7 +14,14 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 import uuid
+
+
+
+def emit_progress(progress, stage, **extra):
+    print('BONECHAIN_PROGRESS ' + json.dumps(
+        {'progress':progress, 'stage':stage, **extra}, ensure_ascii=False), flush=True)
 
 
 def plugin():
@@ -51,7 +58,7 @@ def reveal_object(context, obj):
 
 def worker(job_path, stage):
     import bpy
-    plugin()
+    module = plugin()
     path = Path(job_path)
     job = json.loads(path.read_text())
     scene = bpy.data.scenes[job['scene']] if job.get('scene') else bpy.context.scene
@@ -59,41 +66,53 @@ def worker(job_path, stage):
         bpy.context.window.scene = scene
     if scene != bpy.context.scene:
         raise RuntimeError('无法激活计划中的场景')
-    obj = bpy.data.objects.get(job.get('armature', ''))
-    if not obj or obj.type != 'ARMATURE' or obj.name not in scene.objects:
-        raise RuntimeError('找不到指定骨架')
     if stage == 'plan':
+        emit_progress(0.02, '读取全部插件物理配置')
+        jobs = module._physics_bake_jobs(bpy.context)
+        names = list(dict.fromkeys(arm.name for _kind, arm in jobs))
+        if not names:
+            raise RuntimeError('场景中没有启用的插件物理配置')
         props = scene.bonechain_props
         start = props.native_cloth_start if job['start'] is None else job['start']
         end = props.native_cloth_end if job['end'] is None else job['end']
         if end < start:
             raise RuntimeError('结束帧早于起始帧')
         job.update(scene=scene.name, start=start, end=end, preroll=props.native_cloth_preroll,
-                   stages=[{'kind':job['scope'], 'object':obj.name}])
+                   stages=[{'object':name} for name in names])
         path.write_text(json.dumps(job, ensure_ascii=False, indent=2))
     else:
+        index, count = int(stage), len(job['stages'])
+        obj = bpy.data.objects[job['stages'][index]['object']]
+        emit_progress(0.05 + 0.9 * index / count, '准备全部物理求解：' + obj.name)
+        last_sent = [0.0]
+        def report_sample(progress, frame, frame_range):
+            now = time.monotonic()
+            if now - last_sent[0] < 0.25 and progress < 1.0:
+                return
+            last_sent[0] = now
+            owner = module._BONECHAIN_BAKE_OWNER
+            label = getattr(owner, '_progress_stage', '物理采样')
+            emit_progress(0.05 + 0.9 * (index + 0.9 * progress) / count,
+                          label, frame=frame, end=frame_range[1])
+        module._BONECHAIN_PROGRESS_CALLBACK = report_sample
         restore_visibility = reveal_object(bpy.context, obj)
         try:
-            if bpy.context.object and bpy.context.object.mode != 'OBJECT':
+            if getattr(bpy.context, 'object', None) and bpy.context.object.mode != 'OBJECT':
                 bpy.ops.object.mode_set(mode='OBJECT')
             bpy.context.view_layer.objects.active = obj
-            with bpy.context.temp_override(object=obj, active_object=obj):
-                if job['scope'] == 'RURI':
-                    if not bpy.ops.bonechain.ruri_bake.poll():
-                        raise RuntimeError('当前骨架没有可用的 Ruri 配置')
-                    result = bpy.ops.bonechain.ruri_bake('EXEC_DEFAULT', frame_start=job['start'],
-                        frame_end=job['end'], preroll=job['preroll'])
-                else:
-                    if not bpy.ops.bonechain.wiggle_bake.poll():
-                        raise RuntimeError('当前骨架不可执行 Wiggle 烘焙')
-                    result = bpy.ops.bonechain.wiggle_bake('EXEC_DEFAULT', frame_start=job['start'],
-                        frame_end=job['end'])
+            result = bpy.ops.bonechain.physics_bake('EXEC_DEFAULT', armature_name=obj.name)
             if 'FINISHED' not in result:
-                raise RuntimeError('骨架烘焙未完成，原工程保留')
+                raise RuntimeError('骨架物理烘焙未完成，原工程保留')
         finally:
+            module._BONECHAIN_PROGRESS_CALLBACK = None
             restore_visibility()
+    emit_progress(0.03 if stage == 'plan' else 0.05 + 0.9 * (index + 0.95) / count,
+                  '准备工作进程' if stage == 'plan' else '保存烘焙工程')
     bpy.context.preferences.filepaths.save_version = 0
     bpy.ops.wm.save_as_mainfile(filepath=job['output'], compress=True)
+    receipt = path.with_name(path.name + '.' + str(stage) + '.done.json')
+    receipt.write_text(json.dumps({'stage':str(stage), 'output':job['output'],
+                                   'bytes':Path(job['output']).stat().st_size}))
     print('CHECKPOINT', job['output'], flush=True)
 
 
@@ -104,8 +123,6 @@ def main():
     parser.add_argument('--start', type=int)
     parser.add_argument('--end', type=int)
     parser.add_argument('--memory-limit', default='8G')
-    parser.add_argument('--scope', choices=['RURI', 'WIGGLE'], default='RURI')
-    parser.add_argument('--armature', required=True)
     args = parser.parse_args()
     source = args.project.resolve()
     blender = shutil.which(args.blender)
@@ -118,7 +135,7 @@ def main():
     output = source.with_name(stem + '.blend')
     job_path = source.with_name(stem + '.json')
     job = {'source':str(source), 'output':str(output), 'start':args.start,
-           'end':args.end, 'scope':args.scope, 'armature':args.armature}
+           'end':args.end}
     job_path.write_text(json.dumps(job, ensure_ascii=False, indent=2))
     script = str(Path(__file__).resolve())
     match = re.fullmatch(r'(\d+)([KMGT]?)(?:i?B)?', args.memory_limit, re.IGNORECASE)
@@ -141,21 +158,35 @@ def main():
                '-p', 'MemorySwapMax=0', blender, '--background', str(input_file),
                '--python-exit-code', '1', '--python', script, '--', '--worker', str(job_path), str(stage)]
         try:
-            return subprocess.run(cmd).returncode
+            code = subprocess.run(cmd).returncode
+            if code:
+                return code
+            receipt = job_path.with_name(job_path.name + '.' + str(stage) + '.done.json')
+            try:
+                completed = json.loads(receipt.read_text())
+                if completed.get('stage') != str(stage) or completed.get('bytes', 0) <= 0:
+                    raise ValueError('invalid completion receipt')
+            except (OSError, ValueError):
+                print('工作进程未确认完成保存，烘焙停止，不标记成功。', file=sys.stderr)
+                return 1
+            return 0
         except KeyboardInterrupt:
             subprocess.run(['systemctl', '--user', 'stop', unit], check=False)
             return 130
+    emit_progress(0.0, '启动并加载工程')
     code = run(source, 'plan')
     if code:
         return code
     job = json.loads(job_path.read_text())
     for index, task in enumerate(job['stages']):
         print(f"阶段 {index + 1}/{len(job['stages'])}: {task}; 内存上限 {args.memory_limit}", flush=True)
+        emit_progress(0.04, '加载烘焙工作进程')
         code = run(output, index)
         if code:
             print('任务已停止；原工程保留。已完成阶段在 ' + str(output)
                   + '；失败阶段未完成，不自动继续。', file=sys.stderr)
             return code
+    emit_progress(1.0, '完成', output=str(output))
     print('完成：' + str(output))
     return 0
 

@@ -1,7 +1,7 @@
 bl_info = {
     "name": "骨骼链阻尼追踪",
     "author": "WANG",
-    "version": (5, 37),
+    "version": (5, 38),
     "blender": (3, 0, 0),
     "location": "View3D > 侧边栏(N) > 骨骼链",
     "description": "Wiggle/Ruri 实时物理、碰撞、骨骼区间烘焙与原动作恢复",
@@ -467,10 +467,6 @@ class BoneChainProps(PropertyGroup):
     native_cloth_open: BoolProperty(
         name='插件物理烘焙', default=False, options={'SKIP_SAVE'},
         description='展开或折叠统一烘焙设置')
-    physics_bake_scope: EnumProperty(
-        name='烘焙类型', default='RURI',
-        items=[('RURI', 'Ruri', '当前绑定骨架全部启用的 Ruri 配置'),
-               ('WIGGLE', 'Wiggle', '当前骨架启用的 Wiggle 骨骼')])
     native_cloth_start: IntProperty(
         name='起始帧', min=-1048574, max=1048574,
         get=lambda self: self.get('native_cloth_start', self.id_data.frame_start),
@@ -2307,6 +2303,7 @@ def _wiggle_bake_range(context, arm, start, end):
 
 
 _BONECHAIN_BAKE_OWNER = None
+_BONECHAIN_PROGRESS_CALLBACK = None
 
 
 class _BoneChainBakeModal:
@@ -2318,6 +2315,8 @@ class _BoneChainBakeModal:
         self._bake_prefix = prefix
         self._timer = None
         self._finished = False
+        self._ui_progress = 0.0
+        self._ui_progress_text = '准备烘焙'
         self._wm = context.window_manager
         self._workspace = context.workspace
         if context.screen and context.screen.is_animation_playing:
@@ -2340,10 +2339,14 @@ class _BoneChainBakeModal:
             return self._finish(context, error=error)
 
     def _show_progress(self, progress):
-        self._wm.progress_update(progress * 100)
+        self._ui_progress = max(0.0, min(0.95, progress * 0.95))
+        self._ui_progress_text = f'{getattr(self, "_progress_stage", self._bake_prefix.upper())} · 第 {bpy.context.scene.frame_current}/{self._range[1]} 帧'
+        if _BONECHAIN_PROGRESS_CALLBACK is not None:
+            _BONECHAIN_PROGRESS_CALLBACK(progress, bpy.context.scene.frame_current, self._range)
+        self._wm.progress_update(self._ui_progress * 100)
         if self._workspace is not None:
             self._workspace.status_text_set(
-                f"{self._bake_prefix.upper()} 烘焙 {progress:.0%} · Esc 中止")
+                f'{self._ui_progress_text} · {self._ui_progress:.1%} · Esc 中止')
 
     def modal(self, context, event):
         if event.type == 'ESC':
@@ -3010,6 +3013,209 @@ class BONECHAIN_OT_wiggle_cancel_bake(Operator):
 # ===============================================================
 # 插件骨骼物理烘焙：只处理 Ruri / Wiggle。
 # ===============================================================
+def _physics_bake_jobs(context):
+    import importlib
+    scene = context.scene
+    world = (importlib.import_module('RuriClothPhysics.blender_host.world')
+             if hasattr(scene, 'ruri_cloth_physics') else None)
+    ruri_jobs, wiggle_jobs = [], []
+    for arm in sorted((o for o in scene.objects if o.type == 'ARMATURE'), key=lambda o: o.name):
+        if arm.name not in context.view_layer.objects:
+            continue
+        body = world.body_entry(scene, arm) if world else None
+        if body is not None and any(c.enabled for c in arm.ruri_cloth_physics.configs):
+            ruri_jobs.append(('Ruri', arm))
+        if (getattr(scene, 'wiggle_enable', False) and getattr(arm, 'wiggle_enable', False)
+                and not getattr(arm, 'wiggle_mute', True)
+                and any((getattr(b, 'wiggle_head', False) or getattr(b, 'wiggle_tail', False))
+                        and not getattr(b, 'wiggle_mute', False) for b in arm.pose.bones)):
+            wiggle_jobs.append(('Wiggle', arm))
+    return ruri_jobs + wiggle_jobs
+
+
+def _physics_bake_source(arm, kinds):
+    ad = arm.animation_data_create()
+    action, slot = ad.action, ad.action_slot
+    handle = slot.handle if slot else 0
+    influence, blend = ad.action_influence, ad.action_blend_type
+    seen = set()
+    while action is not None and action.as_pointer() not in seen:
+        seen.add(action.as_pointer())
+        found = False
+        for kind in kinds:
+            prefix = 'bonechain_' + kind.lower() + '_bake_'
+            if getattr(arm, prefix + 'saved') and action == getattr(arm, prefix + 'output'):
+                action = getattr(arm, prefix + 'restore')
+                handle = getattr(arm, prefix + 'slot')
+                influence = getattr(arm, prefix + 'influence')
+                blend = getattr(arm, prefix + 'blend')
+                found = True
+                break
+        if not found:
+            break
+    return action, handle, influence, blend
+
+
+def _all_physics_bake_range(context, start, end, preroll, armature_name=''):
+    import importlib
+    jobs = _physics_bake_jobs(context)
+    if armature_name:
+        jobs = [(kind, arm) for kind, arm in jobs if arm.name == armature_name]
+    if not jobs:
+        raise RuntimeError('场景中没有启用的插件物理配置')
+    arms = {arm.name: arm for _kind, arm in jobs}
+    kinds = {name: [kind for kind, arm in jobs if arm.name == name] for name in arms}
+    snapshots, roots = {}, {}
+    world = (importlib.import_module('RuriClothPhysics.blender_host.world')
+             if any(kind == 'Ruri' for kind, _arm in jobs) else None)
+    active = context.view_layer.objects.active
+    for name, arm in arms.items():
+        if arm.animation_data and arm.animation_data.use_tweak_mode:
+            raise RuntimeError(f'{name} 请先退出 NLA 动作编辑模式')
+        ad = arm.animation_data_create()
+        fields = {}
+        for kind in ('ruri', 'wiggle'):
+            for field in ('restore', 'output', 'saved', 'slot', 'influence', 'blend'):
+                key = 'bonechain_' + kind + '_bake_' + field
+                fields[key] = getattr(arm, key)
+        fields['bonechain_ruri_bake_bones'] = arm.bonechain_ruri_bake_bones
+        fields['bonechain_ruri_bake_scene'] = arm.bonechain_ruri_bake_scene
+        body = world.body_entry(context.scene, arm) if world else None
+        snapshots[name] = (ad.action, ad.action_slot.handle if ad.action_slot else 0,
+                           ad.action_influence, ad.action_blend_type, fields,
+                           getattr(arm, 'wiggle_freeze', None), body.live if body else None)
+        roots[name] = _physics_bake_source(arm, kinds[name])
+    begun, total_bones, success = set(), 0, False
+    try:
+        for index, (kind, arm) in enumerate(jobs):
+            if arm.name not in begun:
+                _assign_bake_action(arm.animation_data, *roots[arm.name])
+                begun.add(arm.name)
+            context.view_layer.objects.active = arm
+            owner = _BONECHAIN_BAKE_OWNER
+            if owner is not None:
+                owner._progress_stage = f'{index + 1}/{len(jobs)} · {kind} · {arm.name}'
+            original_preroll = None
+            if kind == 'Wiggle':
+                original_preroll = context.scene.wiggle.preroll
+                context.scene.wiggle.preroll = preroll
+            generator = (_ruri_bake_range(context, arm, start, end, preroll)
+                         if kind == 'Ruri' else _wiggle_bake_range(context, arm, start, end))
+            try:
+                while True:
+                    try:
+                        progress = next(generator)
+                    except StopIteration as completed:
+                        total_bones += completed.value[1]
+                        break
+                    yield (index + progress) / len(jobs)
+            finally:
+                generator.close()
+                if original_preroll is not None:
+                    context.scene.wiggle.preroll = original_preroll
+        # Each engine adds its channels to the previous result. Point all
+        # participating records to the final action and the same original input.
+        for name, arm in arms.items():
+            action = arm.animation_data.action
+            source, handle, influence, blend = roots[name]
+            for kind in kinds[name]:
+                prefix = 'bonechain_' + kind.lower() + '_bake_'
+                setattr(arm, prefix + 'output', action)
+                setattr(arm, prefix + 'restore', source)
+                setattr(arm, prefix + 'slot', handle)
+                setattr(arm, prefix + 'influence', influence)
+                setattr(arm, prefix + 'blend', blend)
+        success = True
+    finally:
+        if not success:
+            for name in begun:
+                arm = arms[name]
+                action, handle, influence, blend, fields, freeze, live = snapshots[name]
+                _assign_bake_action(arm.animation_data, action, handle, influence, blend)
+                for key, value in fields.items():
+                    setattr(arm, key, value)
+                if freeze is not None:
+                    arm.wiggle_freeze = freeze
+                body = world.body_entry(context.scene, arm) if world else None
+                if body is not None and live is not None:
+                    body.live = live
+                    importlib.import_module('RuriClothPhysics.blender_host.runtime').forget_body(arm)
+        if active and active.name in context.view_layer.objects:
+            context.view_layer.objects.active = active
+    return ', '.join(arm.animation_data.action.name for arm in arms.values()), total_bones
+
+
+class BONECHAIN_OT_physics_restore_all(Operator):
+    bl_idname = 'bonechain.physics_restore_all'
+    bl_label = '恢复全部插件实时物理'
+    bl_options = {'REGISTER', 'UNDO'}
+    delete_output: BoolProperty(default=False)
+
+    def execute(self, context):
+        import importlib
+        import json
+        if _BONECHAIN_BAKE_OWNER is not None:
+            self.report({'WARNING'}, '请先等待烘焙结束或按 Esc 中止')
+            return {'CANCELLED'}
+        outputs, restored = set(), 0
+        for arm in context.scene.objects:
+            if arm.type != 'ARMATURE':
+                continue
+            ad = arm.animation_data
+            participating = [kind for kind in ('Ruri', 'Wiggle')
+                             if getattr(arm, 'bonechain_' + kind.lower() + '_bake_saved')]
+            if not ad or not participating or not any(ad.action == getattr(
+                    arm, 'bonechain_' + kind.lower() + '_bake_output') for kind in participating):
+                continue
+            source = _physics_bake_source(arm, participating)
+            _assign_bake_action(ad, *source)
+            for kind in participating:
+                prefix = 'bonechain_' + kind.lower() + '_bake_'
+                output = getattr(arm, prefix + 'output')
+                if output is not None:
+                    outputs.add(output)
+                if kind == 'Ruri':
+                    world = importlib.import_module('RuriClothPhysics.blender_host.world')
+                    runtime = importlib.import_module('RuriClothPhysics.blender_host.runtime')
+                    for name in json.loads(arm.bonechain_ruri_bake_bones or '[]'):
+                        if name in arm.pose.bones:
+                            arm.pose.bones[name].matrix_basis = Matrix.Identity(4)
+                    body = world.body_entry(context.scene, arm)
+                    if body:
+                        runtime.forget_body(arm)
+                        body.live = True
+                        runtime.request_reset(arm, 'FULL')
+                    arm.bonechain_ruri_bake_bones = ''
+                    arm.bonechain_ruri_bake_scene = None
+                else:
+                    arm.wiggle_freeze = False
+                    arm.wiggle_mute = False
+                    context.scene.wiggle_enable = True
+                    context.scene.wiggle.reset = True
+                    for bone in arm.pose.bones:
+                        if getattr(bone, 'wiggle_head', False) or getattr(bone, 'wiggle_tail', False):
+                            bone.matrix_basis = Matrix.Identity(4)
+                setattr(arm, prefix + 'saved', False)
+                setattr(arm, prefix + 'output', None)
+                setattr(arm, prefix + 'restore', None)
+            restored += 1
+        context.scene.frame_set(context.scene.frame_current, subframe=context.scene.frame_subframe)
+        context.view_layer.update()
+        removed = 0
+        for action in outputs:
+            if self.delete_output:
+                action.use_fake_user = False
+                if action.users == 0:
+                    bpy.data.actions.remove(action)
+                    removed += 1
+                else:
+                    action.use_fake_user = True
+            else:
+                action.use_fake_user = True
+        self.report({'INFO'}, f'已恢复 {restored} 个骨架的实时物理，删除 {removed} 个未使用的输出动作')
+        return {'FINISHED'}
+
+
 def _native_modal_running(context):
     ids = {'OBJECT_OT_simulation_nodes_cache_bake', 'PTCACHE_OT_bake'}
     return any(getattr(op, 'bl_idname', '') in ids or op.bl_rna.identifier in ids
@@ -3031,7 +3237,7 @@ class BONECHAIN_OT_physics_bake_range(Operator):
 class BONECHAIN_OT_physics_bake_isolated(Operator):
     bl_idname = 'bonechain.physics_bake_isolated'
     bl_label = '内存受限烘焙'
-    bl_description = '独立进程烘焙当前骨架 Ruri 或 Wiggle，限制内存并另存副本；仅支持 Linux'
+    bl_description = '独立进程烘焙场景全部已启用的插件物理，限制内存并另存副本；仅支持 Linux'
 
     def execute(self, context):
         global _BONECHAIN_BAKE_OWNER
@@ -3057,17 +3263,14 @@ class BONECHAIN_OT_physics_bake_isolated(Operator):
             self.report({'ERROR'}, '缺少 bonechain_tools/bake_limited.py，请同时安装隔离烘焙工具目录')
             return {'CANCELLED'}
         props = context.scene.bonechain_props
-        arm = (_ruri_bake_armature(context) if props.physics_bake_scope == 'RURI'
-               else context.active_object)
-        if arm is None or arm.type != 'ARMATURE':
-            self.report({'ERROR'}, '请先选择要烘焙的骨架')
-            return {'CANCELLED'}
         fd, self._log_path = tempfile.mkstemp(prefix='bonechain-bake-', suffix='.log')
         command = [shutil.which('python3') or '/usr/bin/python3', str(script), bpy.data.filepath,
                    '--blender', bpy.app.binary_path, '--start', str(props.native_cloth_start),
                    '--end', str(props.native_cloth_end), '--memory-limit', str(props.native_cloth_memory_gb) + 'G']
-        command += ['--scope', props.physics_bake_scope]
-        command += ['--armature', arm.name]
+        self._log_offset = 0
+        self._log_pending = ''
+        self._ui_progress = 0.0
+        self._ui_progress_text = '启动工作进程'
         self._process = None
         self._timer = None
         self._workspace = context.workspace
@@ -3084,10 +3287,57 @@ class BONECHAIN_OT_physics_bake_isolated(Operator):
                 os.killpg(self._process.pid, signal.SIGINT)
             self.report({'ERROR'}, str(error))
             return {'CANCELLED'}
+        self._wm.progress_begin(0, 100)
         _BONECHAIN_BAKE_OWNER = self
         self._cancel_sent = False
         self.report({'INFO'}, '已启动内存受限烘焙；结果另存新副本。日志：' + self._log_path)
         return {'RUNNING_MODAL'}
+
+    def _finish(self, context, cancelled=False):
+        global _BONECHAIN_BAKE_OWNER
+        if self._process and self._process.poll() is None:
+            import os
+            import signal
+            try:
+                os.killpg(self._process.pid, signal.SIGINT)
+            except ProcessLookupError:
+                pass
+        if self._timer:
+            self._wm.event_timer_remove(self._timer)
+            self._timer = None
+        self._wm.progress_end()
+        if self._workspace:
+            self._workspace.status_text_set(None)
+        _BONECHAIN_BAKE_OWNER = None
+        return {'CANCELLED'}
+
+    def cancel(self, context):
+        self._finish(context, cancelled=True)
+
+    def _read_progress(self):
+        import json
+        try:
+            with open(self._log_path, 'rb') as log:
+                log.seek(self._log_offset)
+                data = log.read(65536)
+                self._log_offset = log.tell()
+        except OSError:
+            return
+        pending = self._log_pending + data.decode('utf-8', errors='replace')
+        lines = pending.split('\n')
+        self._log_pending = lines.pop()[-8192:]
+        for line in lines:
+            if not line.startswith('BONECHAIN_PROGRESS '):
+                continue
+            try:
+                progress = json.loads(line[len('BONECHAIN_PROGRESS '):])
+                self._ui_progress = max(self._ui_progress, min(1.0, max(0.0, float(progress['progress']))))
+                self._ui_progress_text = str(progress['stage'])
+                if 'frame' in progress:
+                    self._ui_progress_text += f" · 第 {progress['frame']}/{progress['end']} 帧"
+            except (ValueError, KeyError, TypeError):
+                continue
+        self._wm.progress_update(self._ui_progress * 100)
 
     def modal(self, context, event):
         global _BONECHAIN_BAKE_OWNER
@@ -3101,13 +3351,17 @@ class BONECHAIN_OT_physics_bake_isolated(Operator):
             self._cancel_sent = True
         if event.type != 'TIMER':
             return {'PASS_THROUGH'}
+        self._read_progress()
+        if context.area:
+            context.area.tag_redraw()
         code = self._process.poll()
         if code is None:
             if self._workspace:
-                self._workspace.status_text_set('独立进程烘焙中（内存受限）· Esc 中止 · 日志：' + self._log_path)
+                self._workspace.status_text_set(f'{self._ui_progress_text} · {self._ui_progress:.1%} · Esc 中止')
             return {'PASS_THROUGH'}
         if self._timer:
             self._wm.event_timer_remove(self._timer)
+        self._wm.progress_end()
         if self._workspace:
             self._workspace.status_text_set(None)
         _BONECHAIN_BAKE_OWNER = None
@@ -3132,26 +3386,26 @@ class BONECHAIN_OT_physics_bake_isolated(Operator):
         return {'FINISHED'} if code == 0 else {'CANCELLED'}
 
 
-class BONECHAIN_OT_physics_bake(Operator):
+class BONECHAIN_OT_physics_bake(_BoneChainBakeModal, Operator):
     bl_idname = 'bonechain.physics_bake'
     bl_label = '正常烘焙'
-    bl_description = '仅烘焙当前骨架的 Ruri 或 Wiggle，不管理 Blender 原生布料'
+    bl_description = '自动烘焙场景中全部已启用的插件骨骼物理，包含 Ruri 所有类型和 Wiggle'
+    armature_name: StringProperty(default='', options={'HIDDEN'})
 
     def execute(self, context):
-        props = context.scene.bonechain_props
-        if props.physics_bake_scope == 'RURI':
-            if not bpy.ops.bonechain.ruri_bake.poll():
-                self.report({'ERROR'}, '请先绑定骨架并启用 Ruri')
-                return {'CANCELLED'}
-            result = bpy.ops.bonechain.ruri_bake('EXEC_DEFAULT', frame_start=props.native_cloth_start,
-                frame_end=props.native_cloth_end, preroll=props.native_cloth_preroll)
-            return {'FINISHED'} if 'RUNNING_MODAL' in result else result
-        if not bpy.ops.bonechain.wiggle_bake.poll():
-            self.report({'ERROR'}, '请先选择骨架')
+        if _BONECHAIN_BAKE_OWNER is not None or _native_modal_running(context):
+            self.report({'ERROR'}, '已有烘焙在运行')
             return {'CANCELLED'}
-        result = bpy.ops.bonechain.wiggle_bake('EXEC_DEFAULT', frame_start=props.native_cloth_start,
-            frame_end=props.native_cloth_end)
-        return {'FINISHED'} if 'RUNNING_MODAL' in result else result
+        props = context.scene.bonechain_props
+        if props.native_cloth_end < props.native_cloth_start:
+            self.report({'ERROR'}, '结束帧不能早于起始帧')
+            return {'CANCELLED'}
+        if not _physics_bake_jobs(context):
+            self.report({'ERROR'}, '场景中没有启用的插件物理')
+            return {'CANCELLED'}
+        return self._start_bake(context, _all_physics_bake_range(context,
+            props.native_cloth_start, props.native_cloth_end, props.native_cloth_preroll,
+            self.armature_name), props.native_cloth_start, props.native_cloth_end, None, 'all')
 
 
 # ===============================================================
@@ -3212,31 +3466,28 @@ def _draw_physics_bake(layout, context):
              icon='TRIA_DOWN' if props.native_cloth_open else 'TRIA_RIGHT')
     if not props.native_cloth_open:
         return
-    box.prop(props, 'physics_bake_scope', expand=True)
-    ruri = props.physics_bake_scope == 'RURI'
-    arm = _ruri_bake_armature(context) if ruri else context.active_object
-    box.label(text='骨架：' + (arm.name if arm and arm.type == 'ARMATURE' else '未选择'))
-    box.label(text='烘焙此骨架全部启用配置', icon='INFO')
+    box.label(text='一键烘焙全部已启用的插件物理', icon='PHYSICS')
     row = box.row(align=True)
     row.prop(props, 'native_cloth_start')
     row.prop(props, 'native_cloth_end')
-    if ruri:
-        box.prop(props, 'native_cloth_preroll')
-    elif hasattr(context.scene, 'wiggle'):
-        box.prop(context.scene.wiggle, 'preroll', text='预模拟帧数')
+    box.prop(props, 'native_cloth_preroll')
     box.operator('bonechain.physics_bake_range', text='使用场景区间', icon='TIME')
     box.operator('bonechain.physics_bake', text='正常烘焙', icon='RENDER_ANIMATION')
     box.prop(props, 'native_cloth_memory_gb')
     box.operator('bonechain.physics_bake_isolated', text='内存受限烘焙', icon='RENDER_ANIMATION')
     box.label(text='受限：Linux · 保存后运行 · 另存副本', icon='INFO')
-    if ruri:
-        box.operator('bonechain.ruri_reset', text='复位 Ruri', icon='FILE_REFRESH')
-        box.operator('bonechain.ruri_delete_bake', text='删除 Ruri 烘焙', icon='TRASH')
-        box.operator('bonechain.ruri_cancel_bake', text='恢复实时（保留烘焙动作）', icon='LOOP_BACK')
-    else:
-        box.operator('bonechain.wiggle_reset', text='复位 Wiggle', icon='FILE_REFRESH')
-        box.operator_context = 'INVOKE_DEFAULT'
-        box.operator('bonechain.wiggle_cancel_bake', text='取消 Wiggle 烘焙／恢复实时', icon='LOOP_BACK')
+    owner = _BONECHAIN_BAKE_OWNER
+    if owner is not None:
+        progress = getattr(owner, '_ui_progress', 0.0)
+        text = getattr(owner, '_ui_progress_text', '准备烘焙')
+        if hasattr(box, 'progress'):
+            box.progress(factor=progress, type='BAR', text=f'{progress:.1%} · {text}')
+        else:
+            box.label(text=f'{progress:.1%} · {text}')
+        box.label(text='Esc 中止', icon='INFO')
+    box.operator('bonechain.physics_restore_all', text='恢复全部实时物理（保留烘焙）', icon='LOOP_BACK')
+    delete = box.operator('bonechain.physics_restore_all', text='删除插件物理烘焙', icon='TRASH')
+    delete.delete_output = True
 
 
 class BONECHAIN_PT_panel(Panel):
@@ -3464,7 +3715,7 @@ classes = (
     BONECHAIN_OT_ruri_reset, BONECHAIN_OT_ruri_bake, BONECHAIN_OT_ruri_cancel_bake,
     BONECHAIN_OT_ruri_delete_bake, BONECHAIN_OT_ruri_scene_range,
     BONECHAIN_OT_physics_bake_range, BONECHAIN_OT_physics_bake,
-    BONECHAIN_OT_physics_bake_isolated,
+    BONECHAIN_OT_physics_bake_isolated, BONECHAIN_OT_physics_restore_all,
     BONECHAIN_UL_groups, BONECHAIN_UL_flex, BONECHAIN_UL_coll,
     BONECHAIN_UL_deform,
     BONECHAIN_PT_panel,
